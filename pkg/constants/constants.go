@@ -261,4 +261,17 @@ const (
 	// PVCEncryptionClassNameAnnotation specifies the name of an EncryptionClass
 	// on a PVC.
 	PVCEncryptionClassNameAnnotation = "csi.vsphere.encryption-class"
+
+	// VMOwnedVolumesAnnotation is set on a VirtualMachine at creation time when
+	// the VMOwnedVolumes feature gate is enabled. Its presence identifies the VM
+	// as a greenfield VM that uses the CsiVolumeInfo-based volume ownership path
+	// for attach/detach operations.
+	VMOwnedVolumesAnnotation = "vmoperator.vmware.com/vm-owned-volumes"
+
+	// CVISystemNamespace is the namespace where CsiVolumeInfo CRs live.
+	CVISystemNamespace = "vmware-system-csi"
+
+	// CVINamePrefix is the prefix used to construct a CsiVolumeInfo CR name
+	// from the CNS volume ID. The full name is CVINamePrefix + volumeID.
+	CVINamePrefix = "cns-volume-"
 )
