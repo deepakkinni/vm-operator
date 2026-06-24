@@ -1335,7 +1335,7 @@ func categorizeVolumeSpecs(
 			}
 		}
 
-		// Only include greenfield volumes that are not tracked by
+		// Only include vm-owned volumes that are not tracked by
 		// legacy CnsNodeVmAttachment or those whose PVCs have been changed.
 		volumeSpecsForBatch = append(volumeSpecsForBatch, vol)
 	}
