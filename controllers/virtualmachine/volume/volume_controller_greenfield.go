@@ -49,7 +49,7 @@ func (r *Reconciler) reconcileGreenfieldVolumes(ctx *pkgctx.VolumeContext) error
 	}
 
 	// Workflow A — Attach volumes that are in spec but NOT in status.
-	if err := r.reconcileGreenfieldAttach(ctx, specVolumeNames); err != nil {
+	if err := r.reconcileGreenfieldAttach(ctx); err != nil {
 		return err
 	}
 
@@ -60,9 +60,7 @@ func (r *Reconciler) reconcileGreenfieldVolumes(ctx *pkgctx.VolumeContext) error
 // that does not yet appear in status.volumes with an attached disk, write the
 // VM entry to the CsiVolumeInfo spec.vms and, once CSI signals green, attach
 // the disk directly to the VM via ReconfigVM.
-func (r *Reconciler) reconcileGreenfieldAttach(
-	ctx *pkgctx.VolumeContext,
-	specVolumeNames map[string]struct{}) error {
+func (r *Reconciler) reconcileGreenfieldAttach(ctx *pkgctx.VolumeContext) error {
 
 	vm := ctx.VM
 

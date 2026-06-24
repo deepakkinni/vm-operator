@@ -134,9 +134,7 @@ func (vs *vSphereVMProvider) GetDiskPathAtSlot(
 // query as the authoritative backstop; that is left for a follow-up.
 func (vs *vSphereVMProvider) captureDroppedVolumeDiskPaths(
 	vmCtx pkgctx.VirtualMachineContext,
-	vcVM *object.VirtualMachine,
-	snapCR *vmopv1.VirtualMachineSnapshot,
-	snapNode *vimtypes.VirtualMachineSnapshotTree) error {
+	snapCR *vmopv1.VirtualMachineSnapshot) error {
 
 	if !pkgcfg.FromContext(vmCtx).Features.VMOwnedVolumes {
 		return nil

@@ -8,7 +8,7 @@ import (
 	"fmt"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	apierrorsutil "k8s.io/apimachinery/pkg/util/errors"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
@@ -42,7 +42,7 @@ func (r *Reconciler) reconcileGreenfieldSnapshotDeletion(
 		}
 	}
 
-	return utilerrors.NewAggregate(errs)
+	return apierrorsutil.NewAggregate(errs)
 }
 
 // evaluateCVIForDeletedSnapshot evaluates whether the VM entry should be

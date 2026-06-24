@@ -425,7 +425,7 @@ func (vs *vSphereVMProvider) reconcileSnapshotRevertDoTask(
 	// Before reverting, capture disk paths for volumes that will be dropped.
 	// This is best-effort: failures are logged but do not block the revert.
 	if pkgcfg.FromContext(vmCtx).Features.VMOwnedVolumes && vmopv1util.IsGreenfieldVM(vmCtx.VM) {
-		if err := vs.captureDroppedVolumeDiskPaths(vmCtx, vcVM, obj, snapNode); err != nil {
+		if err := vs.captureDroppedVolumeDiskPaths(vmCtx, obj); err != nil {
 			logger.Error(err, "Failed to capture disk paths for volumes that will be dropped by revert")
 		}
 	}
