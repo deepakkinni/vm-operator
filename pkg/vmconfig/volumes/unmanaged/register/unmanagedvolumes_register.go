@@ -574,10 +574,19 @@ func registerUnmanagedDisks(
 		return true, nil
 	}
 
-	batchShowsPVCVolumeIDCacheMiss, err := batchAttachReportsMissingPVCVolumeIDInCache(
-		ctx, k8sClient, vm)
-	if err != nil {
-		return false, err
+	// VM-owned VMs are routed to reconcileOwnedVolumes, not through
+	// CnsNodeVMBatchAttachment, so the batch cache-miss signal will never
+	// arrive. Create the CRV as soon as the PVC exists and is pending.
+	vmOwnedVolumes := pkgcfg.FromContext(ctx).Features.VMOwnedVolumes
+
+	var batchShowsPVCVolumeIDCacheMiss bool
+	if !vmOwnedVolumes {
+		var err error
+		batchShowsPVCVolumeIDCacheMiss, err = batchAttachReportsMissingPVCVolumeIDInCache(
+			ctx, k8sClient, vm)
+		if err != nil {
+			return false, err
+		}
 	}
 
 	var hasPending bool
@@ -606,14 +615,15 @@ func registerUnmanagedDisks(
 			continue
 		}
 
-		if !batchShowsPVCVolumeIDCacheMiss {
+		if !vmOwnedVolumes && !batchShowsPVCVolumeIDCacheMiss {
 			hasPending = true
 			continue
 		}
 
-		logger.V(4).Info("Phase 2: PVC pending, batch status shows volume ID cache miss; ensuring CnsRegisterVolume",
+		logger.V(4).Info("Phase 2: PVC pending; ensuring CnsRegisterVolume",
 			"pvc", pvcObj.Name,
-			"isFCD", di.FCD)
+			"isFCD", di.FCD,
+			"deferFcdRegistration", vmOwnedVolumes)
 
 		if _, err := ensureCnsRegisterVolumeForDisk(
 			ctx,
@@ -905,6 +915,17 @@ func ensureCnsRegisterVolumeForDisk(
 
 		// Set the disk backing type.
 		obj.Spec.BackingType = string(diskInfo.BackingType)
+
+		// When VMOwnedVolumes is on, instruct CSI to skip FCD registration and
+		// create the PV and CsiVolumeInfo using the PVC UID as the volume
+		// identity. The disk is already attached as a plain VMDK; creating an
+		// FCD would introduce a mixed snapshot-chain problem.
+		if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes {
+			obj.Spec.DeferFcdRegistration = true
+			obj.Spec.VMName = vm.Name
+			obj.Spec.VMInstanceUUID = vm.Status.InstanceUUID
+			obj.Spec.DiskUUID = diskInfo.UUID
+		}
 
 		// Create the CRV.
 		if err := k8sClient.Create(ctx, obj); err != nil {

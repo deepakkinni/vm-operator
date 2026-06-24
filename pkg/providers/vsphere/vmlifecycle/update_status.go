@@ -1536,15 +1536,26 @@ func updateVolumeStatus(vmCtx pkgctx.VirtualMachineContext) {
 
 		} else if !di.FCD {
 
-			var volName string
-			if volSpec, ok := info.Volumes[di.Target.String()]; ok {
-				volName = volSpec.Name
+			var (
+				volName     string
+				isPVCBacked bool
+			)
+			if vs, ok := info.Volumes[di.Target.String()]; ok {
+				volName = vs.Name
+				isPVCBacked = vs.PersistentVolumeClaim != nil
 			} else {
 				volName = pkgutil.GeneratePVCName("disk", di.UUID)
 			}
 
-			// The disk is a classic, non-FCD that must be added to the list
-			// of volume statuses.
+			// When VMOwnedVolumes is on, a non-FCD disk that already maps to a
+			// PVC-backed spec.volumes entry has been imported via
+			// deferFcdRegistration and is managed, not classic.
+			volType := vmopv1.VolumeTypeClassic
+			if pkgcfg.FromContext(vmCtx).Features.VMOwnedVolumes && isPVCBacked {
+				volType = vmopv1.VolumeTypeManaged
+			}
+
+			// The disk is a non-FCD that must be added to the list of volume statuses.
 			ddi, _ := vmdk.GetVirtualDiskInfoByUUID(
 				vmCtx,
 				nil,         /* no client since props aren't re-fetched */
@@ -1555,7 +1566,7 @@ func updateVolumeStatus(vmCtx pkgctx.VirtualMachineContext) {
 
 			volStatus := vmopv1.VirtualMachineVolumeStatus{
 				Name:      volName,
-				Type:      vmopv1.VolumeTypeClassic,
+				Type:      volType,
 				Attached:  true,
 				DiskUUID:  di.UUID,
 				Limit:     kubeutil.BytesToResource(di.CapacityInBytes),

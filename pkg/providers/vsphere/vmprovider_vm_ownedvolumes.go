@@ -19,7 +19,9 @@ import (
 // AttachOrphanedDiskToVM adds an existing VMDK (identified by its datastore
 // path) to the virtual machine as a plain disk without creating a new virtual
 // disk. This is used for the VM-owned volume attach path where the FCD has
-// been unregistered and the VMDK must be re-attached to the VM.
+// been unregistered and the VMDK must be re-attached to the VM. If a disk
+// with the same backing path is already present on the VM the call is a no-op,
+// which makes the method safe for imported VMs whose disks arrive pre-attached.
 func (vs *vSphereVMProvider) AttachOrphanedDiskToVM(
 	ctx context.Context,
 	vm *vmopv1.VirtualMachine,
@@ -41,6 +43,34 @@ func (vs *vSphereVMProvider) AttachOrphanedDiskToVM(
 	}
 
 	resVM := res.NewVMFromObject(vcVM)
+
+	// Fetch current hardware to check whether the disk is already attached.
+	moVM, err := resVM.GetProperties(vmCtx, []string{"config.hardware.device"})
+	if err != nil {
+		return fmt.Errorf("failed to get VM hardware devices: %w", err)
+	}
+	if moVM.Config != nil {
+		for _, dev := range moVM.Config.Hardware.Device {
+			disk, ok := dev.(*vimtypes.VirtualDisk)
+			if !ok {
+				continue
+			}
+			switch b := disk.Backing.(type) {
+			case *vimtypes.VirtualDiskFlatVer2BackingInfo:
+				if b.FileName == diskPath {
+					return nil
+				}
+			case *vimtypes.VirtualDiskSeSparseBackingInfo:
+				if b.FileName == diskPath {
+					return nil
+				}
+			case *vimtypes.VirtualDiskSparseVer2BackingInfo:
+				if b.FileName == diskPath {
+					return nil
+				}
+			}
+		}
+	}
 
 	backing := &vimtypes.VirtualDiskFlatVer2BackingInfo{
 		DiskMode: string(vimtypes.VirtualDiskModePersistent),
