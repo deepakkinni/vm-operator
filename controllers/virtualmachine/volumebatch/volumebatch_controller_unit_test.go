@@ -30,6 +30,7 @@ import (
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
 	"github.com/vmware-tanzu/vm-operator/controllers/virtualmachine/volumebatch"
 	pkgcfg "github.com/vmware-tanzu/vm-operator/pkg/config"
+	pkgconst "github.com/vmware-tanzu/vm-operator/pkg/constants"
 	"github.com/vmware-tanzu/vm-operator/pkg/constants/testlabels"
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
 	providerfake "github.com/vmware-tanzu/vm-operator/pkg/providers/fake"
@@ -249,6 +250,56 @@ func unitTestsReconcile() {
 				By("Did not create CnsNodeVMBatchAttachment", func() {
 					Expect(getCNSBatchAttachmentForVolumeName(ctx, vm)).To(BeNil())
 					Expect(vm.Status.Volumes).To(BeEmpty())
+				})
+			})
+		})
+
+		When("VM has vm-owned-volumes annotation and VMOwnedVolumes feature gate is enabled", func() {
+			BeforeEach(func() {
+				vm.Annotations = map[string]string{
+					pkgconst.VMOwnedVolumesAnnotation: "true",
+				}
+				vm.Spec.Volumes = append(vm.Spec.Volumes, *vmVolumeWithPVC1)
+				initObjects = append(initObjects, boundPVC1)
+			})
+
+			JustBeforeEach(func() {
+				pkgcfg.SetContext(ctx, func(config *pkgcfg.Config) {
+					config.Features.VMOwnedVolumes = true
+				})
+			})
+
+			It("skips batch attachment and returns success", func() {
+				err := reconciler.ReconcileNormal(volCtx)
+				Expect(err).ToNot(HaveOccurred())
+
+				By("Did not create CnsNodeVMBatchAttachment", func() {
+					Expect(getCNSBatchAttachmentForVolumeName(ctx, vm)).To(BeNil())
+				})
+			})
+		})
+
+		When("VM has vm-owned-volumes annotation but VMOwnedVolumes feature gate is disabled", func() {
+			BeforeEach(func() {
+				vm.Annotations = map[string]string{
+					pkgconst.VMOwnedVolumesAnnotation: "true",
+				}
+				vm.Spec.Volumes = append(vm.Spec.Volumes, *vmVolumeWithPVC1)
+				initObjects = append(initObjects, boundPVC1)
+			})
+
+			JustBeforeEach(func() {
+				pkgcfg.SetContext(ctx, func(config *pkgcfg.Config) {
+					config.Features.VMOwnedVolumes = false
+				})
+			})
+
+			It("still creates a CnsNodeVMBatchAttachment (annotation ignored without feature gate)", func() {
+				err := reconciler.ReconcileNormal(volCtx)
+				Expect(err).ToNot(HaveOccurred())
+
+				By("CnsNodeVMBatchAttachment was created", func() {
+					Expect(getCNSBatchAttachmentForVolumeName(ctx, vm)).ToNot(BeNil())
 				})
 			})
 		})

@@ -340,6 +340,15 @@ func (r *Reconciler) ReconcileNormal(ctx *pkgctx.VolumeContext) error {
 		return nil
 	}
 
+	// VM-owned-volume VMs use the CsiVolumeInfo-based ownership path.
+	// CnsNodeVMBatchAttachment must not be created for these VMs — their
+	// volumes are managed exclusively by the volume controller's
+	// reconcileOwnedVolumes path.
+	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes &&
+		vmopv1util.HasVMOwnedVolumesAnnotation(ctx.VM) {
+		return nil
+	}
+
 	legacyAttachments, err := pkgutil.GetCnsNodeVMAttachmentsForVM(ctx, r.Client, ctx.VM)
 	if err != nil {
 		return fmt.Errorf(

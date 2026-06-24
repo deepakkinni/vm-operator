@@ -7,6 +7,8 @@ package vsphere
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"strings"
 
 	"github.com/vmware/govmomi/vim25/mo"
 	vimtypes "github.com/vmware/govmomi/vim25/types"
@@ -234,8 +236,29 @@ func findVirtualDiskAtSlot(
 			return nil, "", fmt.Errorf("unexpected disk backing type at slot (controller=%d unit=%d)", controllerKey, unitNumber)
 		}
 
-		return disk, backing.FileName, nil
+		return disk, normalizeBackingFileName(backing.FileName), nil
 	}
 
 	return nil, "", fmt.Errorf("virtual disk not found at slot: controllerKey=%d unitNumber=%d", controllerKey, unitNumber)
+}
+
+// normalizeBackingFileName converts a vCenter HTTP folder URL
+// (https://host/folder/<path>?dsName=<ds>&dcPath=<dc>) to the canonical
+// datastore-path format ([<ds>] <path>) expected by CSI and the ReconfigVM
+// attach API. If the input is already a datastore path or does not match the
+// folder-URL shape, it is returned unchanged.
+func normalizeBackingFileName(fileName string) string {
+	if !strings.HasPrefix(fileName, "https://") && !strings.HasPrefix(fileName, "http://") {
+		return fileName
+	}
+	u, err := url.Parse(fileName)
+	if err != nil {
+		return fileName
+	}
+	dsName := u.Query().Get("dsName")
+	filePath := strings.TrimPrefix(u.Path, "/folder/")
+	if dsName == "" || filePath == u.Path {
+		return fileName
+	}
+	return fmt.Sprintf("[%s] %s", dsName, filePath)
 }

@@ -1534,6 +1534,20 @@ func updateVolumeStatus(vmCtx pkgctx.VirtualMachineContext) {
 				}
 			}
 
+			// A non-FCD disk already recorded as Classic may have had its
+			// volume spec populated after the first status write (the
+			// registration race: the disk enters status before
+			// unmanagedvolumes_register adds the PVC-backed spec entry).
+			// Once the spec entry is present, promote the type to Managed so
+			// the status reflects the actual ownership.
+			if !di.FCD && pkgcfg.FromContext(vmCtx).Features.VMOwnedVolumes &&
+				vm.Status.Volumes[diskIndex].Type == vmopv1.VolumeTypeClassic {
+				if vs, ok := info.Volumes[di.Target.String()]; ok &&
+					vs.PersistentVolumeClaim != nil {
+					vm.Status.Volumes[diskIndex].Type = vmopv1.VolumeTypeManaged
+				}
+			}
+
 		} else if !di.FCD {
 
 			var (
