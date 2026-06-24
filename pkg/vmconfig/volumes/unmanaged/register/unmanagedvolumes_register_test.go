@@ -3183,7 +3183,7 @@ var _ = Describe("Reconcile", func() {
 				BeforeEach(func() {
 					// Set up VM with FCD disk that has a volume entry
 					// FCD disks are filtered out early because:
-					// - Greenfield VMs can't have classic/unmanaged disks as FCDs
+					// - VMOwnedVolumes VMs can't have classic/unmanaged disks as FCDs
 					// - Imported VMs can't have any disks as FCDs
 					// - Registered VMs (VADP) have FCDs already registered as PVCs by RegisterVM
 					vm.Spec.Volumes = []vmopv1.VirtualMachineVolume{

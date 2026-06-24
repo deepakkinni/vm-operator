@@ -260,10 +260,10 @@ func (r *Reconciler) ReconcileDelete(ctx *pkgctx.VirtualMachineSnapshotContext) 
 
 	ctx.VM = vm
 
-	// For greenfield VMs, read the snapshot's PVC disk data BEFORE the vSphere
+	// For VM-owned-volumes VMs, read the snapshot's PVC disk data BEFORE the vSphere
 	// snapshot is deleted, since the ExtraConfig lives on the snapshot object.
 	var pvcDisks []backupapi.PVCDiskData
-	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes && vmopv1util.IsGreenfieldVM(vm) {
+	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes && vmopv1util.HasVMOwnedVolumesAnnotation(vm) {
 		var readErr error
 		pvcDisks, readErr = r.VMProvider.GetPVCDiskDataFromSnapshot(ctx.Context, vm, vmSnapshot.Name)
 		if readErr != nil {
@@ -286,9 +286,9 @@ func (r *Reconciler) ReconcileDelete(ctx *pkgctx.VirtualMachineSnapshotContext) 
 
 	// After the vSphere snapshot is gone, evaluate CVI entries for volumes
 	// that were retained solely by this snapshot.
-	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes && vmopv1util.IsGreenfieldVM(vm) && len(pvcDisks) > 0 {
-		if err := r.reconcileGreenfieldSnapshotDeletion(ctx, pvcDisks); err != nil {
-			return fmt.Errorf("failed to evaluate greenfield CVI entries after snapshot deletion: %w", err)
+	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes && vmopv1util.HasVMOwnedVolumesAnnotation(vm) && len(pvcDisks) > 0 {
+		if err := r.reconcileOwnedVolumeSnapshotDeletion(ctx, pvcDisks); err != nil {
+			return fmt.Errorf("failed to evaluate vm-owned-volumes CVI entries after snapshot deletion: %w", err)
 		}
 	}
 

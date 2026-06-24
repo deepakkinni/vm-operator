@@ -20,18 +20,18 @@ import (
 	vmopv1util "github.com/vmware-tanzu/vm-operator/pkg/util/vmopv1"
 )
 
-// reconcileGreenfieldVolumes reconciles CsiVolumeInfo-based volume attach/detach
-// for greenfield VMs. It is called from ReconcileNormal when the VM has the
+// reconcileOwnedVolumes reconciles CsiVolumeInfo-based volume attach/detach
+// for VM-owned-volumes VMs. It is called from ReconcileNormal when the VM has the
 // VMOwnedVolumes annotation. It handles Workflow A (attach) and Workflow B
 // (detach).
-func (r *Reconciler) reconcileGreenfieldVolumes(ctx *pkgctx.VolumeContext) error {
+func (r *Reconciler) reconcileOwnedVolumes(ctx *pkgctx.VolumeContext) error {
 	vm := ctx.VM
 
 	// Ensure the CVI cleanup finalizer is present so that CsiVolumeInfo entries
 	// are cleaned up before the VM CR is garbage-collected.
 	if !controllerutil.ContainsFinalizer(vm, pkgconst.CVICleanupFinalizer) {
 		controllerutil.AddFinalizer(vm, pkgconst.CVICleanupFinalizer)
-		ctx.Logger.Info("Added CVICleanupFinalizer to greenfield VM")
+		ctx.Logger.Info("Added CVICleanupFinalizer to VM-owned-volumes VM")
 		// Return immediately so the patch helper persists the finalizer before
 		// any further reconciliation.
 		return nil
@@ -44,23 +44,23 @@ func (r *Reconciler) reconcileGreenfieldVolumes(ctx *pkgctx.VolumeContext) error
 	}
 
 	// Workflow B — Detach volumes that are in status but NOT in spec.
-	if err := r.reconcileGreenfieldDetach(ctx, specVolumeNames); err != nil {
+	if err := r.reconcileOwnedVolumeDetach(ctx, specVolumeNames); err != nil {
 		return err
 	}
 
 	// Workflow A — Attach volumes that are in spec but NOT in status.
-	if err := r.reconcileGreenfieldAttach(ctx); err != nil {
+	if err := r.reconcileOwnedVolumeAttach(ctx); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-// reconcileGreenfieldAttach processes Workflow A: for each volume in spec.volumes
+// reconcileOwnedVolumeAttach processes Workflow A: for each volume in spec.volumes
 // that does not yet appear in status.volumes with an attached disk, write the
 // VM entry to the CsiVolumeInfo spec.vms and, once CSI signals green, attach
 // the disk directly to the VM via ReconfigVM.
-func (r *Reconciler) reconcileGreenfieldAttach(ctx *pkgctx.VolumeContext) error {
+func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error {
 
 	vm := ctx.VM
 
@@ -93,7 +93,7 @@ func (r *Reconciler) reconcileGreenfieldAttach(ctx *pkgctx.VolumeContext) error 
 		if err != nil {
 			if apierrors.IsNotFound(err) {
 				// Brownfield PVC without a CsiVolumeInfo — skip; legacy path handles it.
-				ctx.Logger.Info("No CsiVolumeInfo for PVC — skipping greenfield path",
+				ctx.Logger.Info("No CsiVolumeInfo for PVC — skipping vm-owned volumes path",
 					"pvc", claimName)
 				continue
 			}
@@ -149,10 +149,10 @@ func (r *Reconciler) reconcileGreenfieldAttach(ctx *pkgctx.VolumeContext) error 
 	return nil
 }
 
-// reconcileGreenfieldDetach processes Workflow B: for each volume in
+// reconcileOwnedVolumeDetach processes Workflow B: for each volume in
 // status.volumes that is NOT in spec.volumes, detach the disk from the VM and
 // remove the VM entry from the CsiVolumeInfo.
-func (r *Reconciler) reconcileGreenfieldDetach(
+func (r *Reconciler) reconcileOwnedVolumeDetach(
 	ctx *pkgctx.VolumeContext,
 	specVolumeNames map[string]struct{}) error {
 
@@ -241,11 +241,11 @@ func (r *Reconciler) removeVolumeStatus(ctx *pkgctx.VolumeContext, name string) 
 	ctx.VM.Status.Volumes = volumes
 }
 
-// reconcileGreenfieldDelete cleans up CsiVolumeInfo entries for a greenfield VM
+// reconcileOwnedVolumeDelete cleans up CsiVolumeInfo entries for a VM-owned-volumes VM
 // that is being deleted. It removes this VM's entry from each CVI that still
 // references it, then removes the CVICleanupFinalizer so the VM CR can be
 // garbage-collected.
-func (r *Reconciler) reconcileGreenfieldDelete(ctx *pkgctx.VolumeContext) error {
+func (r *Reconciler) reconcileOwnedVolumeDelete(ctx *pkgctx.VolumeContext) error {
 	vm := ctx.VM
 
 	if !controllerutil.ContainsFinalizer(vm, pkgconst.CVICleanupFinalizer) {
@@ -253,7 +253,7 @@ func (r *Reconciler) reconcileGreenfieldDelete(ctx *pkgctx.VolumeContext) error 
 		return nil
 	}
 
-	ctx.Logger.Info("Reconciling greenfield VM deletion: cleaning up CsiVolumeInfo entries")
+	ctx.Logger.Info("Reconciling VM-owned-volumes VM deletion: cleaning up CsiVolumeInfo entries")
 
 	for _, vol := range vm.Spec.Volumes {
 		if vol.PersistentVolumeClaim == nil {
@@ -290,7 +290,7 @@ func (r *Reconciler) reconcileGreenfieldDelete(ctx *pkgctx.VolumeContext) error 
 
 	// All CVI entries cleaned up — remove the finalizer so the VM CR can be deleted.
 	controllerutil.RemoveFinalizer(vm, pkgconst.CVICleanupFinalizer)
-	ctx.Logger.Info("Removed CVICleanupFinalizer from greenfield VM")
+	ctx.Logger.Info("Removed CVICleanupFinalizer from VM-owned-volumes VM")
 
 	return nil
 }

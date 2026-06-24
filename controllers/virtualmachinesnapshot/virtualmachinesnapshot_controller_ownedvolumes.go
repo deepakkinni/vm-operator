@@ -17,8 +17,8 @@ import (
 	vmopv1util "github.com/vmware-tanzu/vm-operator/pkg/util/vmopv1"
 )
 
-// reconcileGreenfieldSnapshotDeletion evaluates CsiVolumeInfo entries for
-// greenfield volumes retained by the snapshot being deleted. It removes a
+// reconcileOwnedVolumeSnapshotDeletion evaluates CsiVolumeInfo entries for
+// vm-owned volumes retained by the snapshot being deleted. It removes a
 // VM's entry from spec.vms for each disk that is no longer attached to the
 // VM and not retained by any remaining snapshot.
 //
@@ -27,7 +27,7 @@ import (
 // NOTE: This covers managed snapshots only (those with a VirtualMachineSnapshot
 // CR). Unmanaged snapshots (out-of-band, no CR) require a vCenter snapshot tree
 // query as the authoritative backstop; that is left for a follow-up.
-func (r *Reconciler) reconcileGreenfieldSnapshotDeletion(
+func (r *Reconciler) reconcileOwnedVolumeSnapshotDeletion(
 	ctx *pkgctx.VirtualMachineSnapshotContext,
 	pvcDisks []backupapi.PVCDiskData) error {
 

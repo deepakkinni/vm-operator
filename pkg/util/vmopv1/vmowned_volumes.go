@@ -17,9 +17,9 @@ import (
 	pkgconst "github.com/vmware-tanzu/vm-operator/pkg/constants"
 )
 
-// IsGreenfieldVM reports whether the VM is a greenfield VM that uses the
+// HasVMOwnedVolumesAnnotation reports whether the VM is a VM-owned-volumes VM that uses the
 // CsiVolumeInfo-based volume ownership path.
-func IsGreenfieldVM(vm *vmopv1.VirtualMachine) bool {
+func HasVMOwnedVolumesAnnotation(vm *vmopv1.VirtualMachine) bool {
 	return metav1.HasAnnotation(vm.ObjectMeta, pkgconst.VMOwnedVolumesAnnotation)
 }
 

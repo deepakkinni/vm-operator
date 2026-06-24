@@ -25,7 +25,7 @@ import (
 )
 
 var _ = Describe(
-	"Greenfield ReconcileNormal",
+	"VMOwnedVolumes ReconcileNormal",
 	Label(testlabels.Controller),
 	func() {
 		const (
@@ -148,7 +148,7 @@ var _ = Describe(
 				})
 			})
 
-			When("VM has the greenfield annotation", func() {
+			When("VM has the vm-owned-volumes annotation", func() {
 				BeforeEach(func() {
 					vm.Annotations = map[string]string{
 						pkgconst.VMOwnedVolumesAnnotation: "true",
@@ -167,9 +167,9 @@ var _ = Describe(
 					}
 				})
 
-				It("does not enter the greenfield path — CVICleanupFinalizer is NOT added", func() {
+				It("does not enter the vm-owned volumes path — CVICleanupFinalizer is NOT added", func() {
 					// With the feature disabled, ReconcileNormal skips the
-					// greenfield branch regardless of the annotation.
+					// vm-owned-volumes branch regardless of the annotation.
 					_ = reconciler.ReconcileNormal(volCtx)
 					Expect(vm.Finalizers).NotTo(ContainElement(pkgconst.CVICleanupFinalizer))
 				})
@@ -183,7 +183,7 @@ var _ = Describe(
 				})
 			})
 
-			When("VM does NOT have the greenfield annotation", func() {
+			When("VM does NOT have the vm-owned-volumes annotation", func() {
 				BeforeEach(func() {
 					vm.Annotations = nil
 					vm.Spec.Volumes = []vmopv1.VirtualMachineVolume{
@@ -206,7 +206,7 @@ var _ = Describe(
 				})
 			})
 
-			When("VM has the greenfield annotation", func() {
+			When("VM has the vm-owned-volumes annotation", func() {
 				BeforeEach(func() {
 					vm.Annotations = map[string]string{
 						pkgconst.VMOwnedVolumesAnnotation: "true",
@@ -214,7 +214,7 @@ var _ = Describe(
 				})
 
 				It("adds CVICleanupFinalizer on first reconcile and returns nil", func() {
-					// First reconcile: finalizer is absent → greenfield path adds it
+					// First reconcile: finalizer is absent → vm-owned volumes path adds it
 					// and returns immediately (before any volume work).
 					err := reconciler.ReconcileNormal(volCtx)
 					Expect(err).ToNot(HaveOccurred())
@@ -343,7 +343,7 @@ var _ = Describe(
 									},
 								},
 							}
-							// No CVI: GetCVIForPVC returns not-found → greenfield skips.
+							// No CVI: GetCVIForPVC returns not-found → vm-owned-volumes skips.
 							initObjects = append(initObjects, pvc, pv)
 
 							vm.Spec.Volumes = []vmopv1.VirtualMachineVolume{

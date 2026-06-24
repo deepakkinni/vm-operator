@@ -801,7 +801,7 @@ func ResolveImageNameOnCreate(
 
 // SetVMOwnedVolumesAnnotation stamps the VMOwnedVolumesAnnotation on a new VM
 // when the VMOwnedVolumes feature gate is enabled. Its presence marks the VM as
-// a greenfield VM that uses the CsiVolumeInfo-based volume ownership path for
+// a VM-owned-volumes VM that uses the CsiVolumeInfo-based volume ownership path for
 // attach/detach operations.
 func SetVMOwnedVolumesAnnotation(
 	ctx *pkgctx.WebhookRequestContext,

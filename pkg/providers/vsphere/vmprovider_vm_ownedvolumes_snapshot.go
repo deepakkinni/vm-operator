@@ -27,7 +27,7 @@ import (
 // GetPVCDiskDataFromSnapshot reads the PVCDiskData ExtraConfig key from the
 // named vSphere snapshot and returns the decoded list of PVC-backed disk
 // entries. Returns an empty slice (not an error) if the snapshot has no
-// PVCDiskData key or if the VM is not greenfield.
+// PVCDiskData key or if the VM does not have the VMOwnedVolumes annotation.
 func (vs *vSphereVMProvider) GetPVCDiskDataFromSnapshot(
 	ctx context.Context,
 	vm *vmopv1.VirtualMachine,
@@ -68,7 +68,7 @@ func (vs *vSphereVMProvider) GetPVCDiskDataFromSnapshot(
 	ecList := object.OptionValueList(moSnap.Config.ExtraConfig)
 	raw, _ := ecList.GetString(backupapi.PVCDiskDataExtraConfigKey)
 	if raw == "" {
-		// No PVC disk data in this snapshot — not a greenfield snapshot.
+		// No PVC disk data in this snapshot — not a vm-owned volume snapshot.
 		return nil, nil
 	}
 
@@ -127,7 +127,7 @@ func (vs *vSphereVMProvider) GetDiskPathAtSlot(
 // captureDroppedVolumeDiskPaths records the current VMDK datastore paths for
 // volumes that will be dropped by the upcoming snapshot revert. This is a
 // best-effort, just-in-time capture: if it fails, Workflow B (reconcile
-// greenfield detach) will handle re-registration on the next reconcile pass.
+// vm-owned volume detach) will handle re-registration on the next reconcile pass.
 //
 // NOTE: This covers managed snapshots only (those with a VirtualMachineSnapshot
 // CR). Unmanaged snapshots (out-of-band, no CR) require a vCenter snapshot tree
@@ -139,7 +139,7 @@ func (vs *vSphereVMProvider) captureDroppedVolumeDiskPaths(
 	if !pkgcfg.FromContext(vmCtx).Features.VMOwnedVolumes {
 		return nil
 	}
-	if !vmopv1util.IsGreenfieldVM(vmCtx.VM) {
+	if !vmopv1util.HasVMOwnedVolumesAnnotation(vmCtx.VM) {
 		return nil
 	}
 

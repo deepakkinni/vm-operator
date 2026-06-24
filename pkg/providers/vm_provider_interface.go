@@ -108,7 +108,7 @@ type VirtualMachineProviderInterface interface {
 	// GetPVCDiskDataFromSnapshot reads the PVCDiskData ExtraConfig key from the
 	// named vSphere snapshot and returns the decoded list of PVC-backed disk
 	// entries. Returns an empty slice (not an error) if the snapshot has no
-	// PVCDiskData key or if the VM is not greenfield.
+	// PVCDiskData key or if the VM does not have the VMOwnedVolumes annotation.
 	GetPVCDiskDataFromSnapshot(ctx context.Context, vm *vmopv1.VirtualMachine, snapshotName string) ([]backupapi.PVCDiskData, error)
 
 	// GetDiskPathAtSlot returns the datastore path of the virtual disk at the

@@ -22,7 +22,7 @@ import (
 	vmopv1util "github.com/vmware-tanzu/vm-operator/pkg/util/vmopv1"
 )
 
-var _ = DescribeTable("IsGreenfieldVM",
+var _ = DescribeTable("HasVMOwnedVolumesAnnotation",
 	func(annotations map[string]string, expected bool) {
 		vm := &vmopv1.VirtualMachine{
 			ObjectMeta: metav1.ObjectMeta{
@@ -31,7 +31,7 @@ var _ = DescribeTable("IsGreenfieldVM",
 				Annotations: annotations,
 			},
 		}
-		Ω(vmopv1util.IsGreenfieldVM(vm)).Should(Equal(expected))
+		Ω(vmopv1util.HasVMOwnedVolumesAnnotation(vm)).Should(Equal(expected))
 	},
 	Entry("returns true when annotation is present",
 		map[string]string{pkgconst.VMOwnedVolumesAnnotation: "true"},
@@ -225,11 +225,11 @@ var _ = Describe("GetCVIForPVC", func() {
 		Ω(cnsv1alpha1.AddToScheme(scheme)).To(Succeed())
 	})
 
-	buildPVC := func(name, namespace, volumeName string) *corev1.PersistentVolumeClaim {
+	buildPVC := func(volumeName string) *corev1.PersistentVolumeClaim {
 		return &corev1.PersistentVolumeClaim{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      name,
-				Namespace: namespace,
+				Name:      pvcName,
+				Namespace: ns,
 			},
 			Spec: corev1.PersistentVolumeClaimSpec{
 				VolumeName: volumeName,
@@ -260,7 +260,7 @@ var _ = Describe("GetCVIForPVC", func() {
 	}
 
 	It("returns the CVI when PVC is bound to a PV with a CSI source", func() {
-		pvc := buildPVC(pvcName, ns, pvName)
+		pvc := buildPVC(pvName)
 		pv := buildPV(pvName, &corev1.CSIPersistentVolumeSource{
 			VolumeHandle: volumeID,
 		})
@@ -289,7 +289,7 @@ var _ = Describe("GetCVIForPVC", func() {
 	})
 
 	It("returns error when PVC is unbound (spec.volumeName is empty)", func() {
-		pvc := buildPVC(pvcName, ns, "") // empty volumeName = unbound
+		pvc := buildPVC("") // empty volumeName = unbound
 
 		c := fake.NewClientBuilder().
 			WithScheme(scheme).
@@ -303,7 +303,7 @@ var _ = Describe("GetCVIForPVC", func() {
 	})
 
 	It("returns error when PV has no CSI source", func() {
-		pvc := buildPVC(pvcName, ns, pvName)
+		pvc := buildPVC(pvName)
 		pv := buildPV(pvName, nil) // nil CSI source
 
 		c := fake.NewClientBuilder().
@@ -318,7 +318,7 @@ var _ = Describe("GetCVIForPVC", func() {
 	})
 
 	It("returns not-found-compatible error when CVI does not exist", func() {
-		pvc := buildPVC(pvcName, ns, pvName)
+		pvc := buildPVC(pvName)
 		pv := buildPV(pvName, &corev1.CSIPersistentVolumeSource{
 			VolumeHandle: volumeID,
 		})

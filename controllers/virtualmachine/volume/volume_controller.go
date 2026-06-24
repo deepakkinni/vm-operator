@@ -281,13 +281,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (_ ctr
 }
 
 func (r *Reconciler) ReconcileDelete(ctx *pkgctx.VolumeContext) error {
-	// For greenfield VMs, clean up CsiVolumeInfo entries that reference this VM
+	// For VM-owned-volumes VMs, clean up CsiVolumeInfo entries that reference this VM
 	// before allowing the VM CR to be deleted.
-	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes && vmopv1util.IsGreenfieldVM(ctx.VM) {
-		return r.reconcileGreenfieldDelete(ctx)
+	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes && vmopv1util.HasVMOwnedVolumesAnnotation(ctx.VM) {
+		return r.reconcileOwnedVolumeDelete(ctx)
 	}
 
-	// For non-greenfield VMs, depend on the Garbage Collector to clean up
+	// For non-VM-owned-volumes VMs, depend on the Garbage Collector to clean up
 	// dependent CNSNodeVMAttachment objects when their owning VM is deleted.
 	// The Volume provider handles the case where the VM is deleted before
 	// volumes are detached & removed.
@@ -327,10 +327,10 @@ func (r *Reconciler) ReconcileNormal(ctx *pkgctx.VolumeContext) error {
 		return nil
 	}
 
-	// Greenfield VMs use the CsiVolumeInfo-based ownership path. Bypass the
+	// VMOwnedVolumes VMs use the CsiVolumeInfo-based ownership path. Bypass the
 	// legacy CnsNodeVmAttachment path entirely for these VMs.
-	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes && vmopv1util.IsGreenfieldVM(ctx.VM) {
-		return r.reconcileGreenfieldVolumes(ctx)
+	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes && vmopv1util.HasVMOwnedVolumesAnnotation(ctx.VM) {
+		return r.reconcileOwnedVolumes(ctx)
 	}
 
 	attachments, err := r.getAttachmentsForVM(ctx)

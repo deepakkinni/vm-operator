@@ -264,7 +264,7 @@ const (
 
 	// VMOwnedVolumesAnnotation is set on a VirtualMachine at creation time when
 	// the VMOwnedVolumes feature gate is enabled. Its presence identifies the VM
-	// as a greenfield VM that uses the CsiVolumeInfo-based volume ownership path
+	// as a VM-owned-volumes VM that uses the CsiVolumeInfo-based volume ownership path
 	// for attach/detach operations.
 	VMOwnedVolumesAnnotation = "vmoperator.vmware.com/vm-owned-volumes"
 
@@ -275,7 +275,7 @@ const (
 	// from the CNS volume ID. The full name is CVINamePrefix + volumeID.
 	CVINamePrefix = "cns-volume-"
 
-	// CVICleanupFinalizer is placed on greenfield VMs to ensure CsiVolumeInfo
+	// CVICleanupFinalizer is placed on VM-owned-volumes VMs to ensure CsiVolumeInfo
 	// entries referencing the VM are cleaned up before the VM CR is deleted.
 	CVICleanupFinalizer = "vmoperator.vmware.com/cvi-cleanup"
 )

@@ -1615,7 +1615,7 @@ func (v validator) validateVolumes(
 				volPath)...)
 
 		// For UPDATE requests only: validate that newly-added PVC volumes with
-		// Persistent diskMode are safe to attach on a greenfield (VM-owned) VM.
+		// Persistent diskMode are safe to attach on a vm-owned VM.
 		if oldVM != nil &&
 			oldVolumesMap[vol.Name] == nil &&
 			pkgcfg.FromContext(ctx).Features.VMOwnedVolumes &&
@@ -1624,7 +1624,7 @@ func (v validator) validateVolumes(
 			(vol.DiskMode == "" || vol.DiskMode == vmopv1.VolumeDiskModePersistent) {
 
 			allErrs = append(allErrs,
-				validateGreenfieldVolumeAttach(ctx, v.client, vm, vol, volPath)...)
+				validateOwnedVolumeAttach(ctx, v.client, vm, vol, volPath)...)
 		}
 
 	}
@@ -3682,10 +3682,10 @@ func isNetworkDeviceProperty(key string) bool {
 	return ethernetDeviceKeyRE.MatchString(key)
 }
 
-// validateGreenfieldVolumeAttach validates a volume being added to a greenfield VM.
+// validateOwnedVolumeAttach validates a volume being added to a VM-owned-volumes VM.
 // It rejects the addition if a CsiVolumeInfo CR already has a spec.vms entry for
 // a different VM (RWO concurrent attach protection).
-func validateGreenfieldVolumeAttach(
+func validateOwnedVolumeAttach(
 	ctx *pkgctx.WebhookRequestContext,
 	c ctrlclient.Client,
 	vm *vmopv1.VirtualMachine,
