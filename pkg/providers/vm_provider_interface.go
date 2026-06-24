@@ -17,6 +17,7 @@ import (
 
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
 	infrav1 "github.com/vmware-tanzu/vm-operator/external/infra/api/v1alpha1"
+	backupapi "github.com/vmware-tanzu/vm-operator/pkg/backup/api"
 	"github.com/vmware-tanzu/vm-operator/pkg/util/vsphere/client"
 )
 
@@ -103,4 +104,15 @@ type VirtualMachineProviderInterface interface {
 	// The slot is identified by controllerType, controllerBusNumber, and
 	// unitNumber as recorded in vm.status.volumes.
 	DetachDiskAtSlot(ctx context.Context, vm *vmopv1.VirtualMachine, controllerType vmopv1.VirtualControllerType, controllerBusNumber, unitNumber int32) (diskPath string, retErr error)
+
+	// GetPVCDiskDataFromSnapshot reads the PVCDiskData ExtraConfig key from the
+	// named vSphere snapshot and returns the decoded list of PVC-backed disk
+	// entries. Returns an empty slice (not an error) if the snapshot has no
+	// PVCDiskData key or if the VM is not greenfield.
+	GetPVCDiskDataFromSnapshot(ctx context.Context, vm *vmopv1.VirtualMachine, snapshotName string) ([]backupapi.PVCDiskData, error)
+
+	// GetDiskPathAtSlot returns the datastore path of the virtual disk at the
+	// given controller slot without detaching it. Returns an error if no disk
+	// is found at that slot.
+	GetDiskPathAtSlot(ctx context.Context, vm *vmopv1.VirtualMachine, controllerType vmopv1.VirtualControllerType, controllerBusNumber, unitNumber int32) (string, error)
 }

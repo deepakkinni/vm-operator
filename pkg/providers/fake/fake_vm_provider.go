@@ -20,6 +20,7 @@ import (
 
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
 	pkgcfg "github.com/vmware-tanzu/vm-operator/pkg/config"
+	backupapi "github.com/vmware-tanzu/vm-operator/pkg/backup/api"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers"
 	vsclient "github.com/vmware-tanzu/vm-operator/pkg/util/vsphere/client"
 )
@@ -491,6 +492,16 @@ func (s *VMProvider) AttachOrphanedDiskToVM(_ context.Context, _ *vmopv1.Virtual
 
 // DetachDiskAtSlot is a no-op stub for the fake provider.
 func (s *VMProvider) DetachDiskAtSlot(_ context.Context, _ *vmopv1.VirtualMachine, _ vmopv1.VirtualControllerType, _, _ int32) (string, error) {
+	return "", nil
+}
+
+// GetPVCDiskDataFromSnapshot is a no-op stub for the fake provider.
+func (s *VMProvider) GetPVCDiskDataFromSnapshot(_ context.Context, _ *vmopv1.VirtualMachine, _ string) ([]backupapi.PVCDiskData, error) {
+	return nil, nil
+}
+
+// GetDiskPathAtSlot is a no-op stub for the fake provider.
+func (s *VMProvider) GetDiskPathAtSlot(_ context.Context, _ *vmopv1.VirtualMachine, _ vmopv1.VirtualControllerType, _, _ int32) (string, error) {
 	return "", nil
 }
 

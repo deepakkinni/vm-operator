@@ -18,6 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
+	backupapi "github.com/vmware-tanzu/vm-operator/pkg/backup/api"
 	pkgcond "github.com/vmware-tanzu/vm-operator/pkg/conditions"
 	pkgcfg "github.com/vmware-tanzu/vm-operator/pkg/config"
 	"github.com/vmware-tanzu/vm-operator/pkg/constants"
@@ -259,6 +260,18 @@ func (r *Reconciler) ReconcileDelete(ctx *pkgctx.VirtualMachineSnapshotContext) 
 
 	ctx.VM = vm
 
+	// For greenfield VMs, read the snapshot's PVC disk data BEFORE the vSphere
+	// snapshot is deleted, since the ExtraConfig lives on the snapshot object.
+	var pvcDisks []backupapi.PVCDiskData
+	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes && vmopv1util.IsGreenfieldVM(vm) {
+		var readErr error
+		pvcDisks, readErr = r.VMProvider.GetPVCDiskDataFromSnapshot(ctx.Context, vm, vmSnapshot.Name)
+		if readErr != nil {
+			ctx.Logger.Error(readErr, "Failed to read PVC disk data from snapshot before deletion")
+			// Non-fatal: proceed; CVI entries won't be cleaned up this cycle.
+		}
+	}
+
 	// delete snapshot from the VM
 	vmNotFound, err := r.deleteSnapshot(ctx)
 	if err != nil {
@@ -269,6 +282,14 @@ func (r *Reconciler) ReconcileDelete(ctx *pkgctx.VirtualMachineSnapshotContext) 
 			" snapshot is deleted along with moVM, remove finalizer")
 		controllerutil.RemoveFinalizer(vmSnapshot, Finalizer)
 		return nil
+	}
+
+	// After the vSphere snapshot is gone, evaluate CVI entries for volumes
+	// that were retained solely by this snapshot.
+	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes && vmopv1util.IsGreenfieldVM(vm) && len(pvcDisks) > 0 {
+		if err := r.reconcileGreenfieldSnapshotDeletion(ctx, pvcDisks); err != nil {
+			return fmt.Errorf("failed to evaluate greenfield CVI entries after snapshot deletion: %w", err)
+		}
 	}
 
 	if err := r.syncVMSSnapshotTreeStatus(ctx); err != nil {
