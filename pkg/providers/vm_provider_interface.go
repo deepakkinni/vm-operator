@@ -115,4 +115,11 @@ type VirtualMachineProviderInterface interface {
 	// given controller slot without detaching it. Returns an error if no disk
 	// is found at that slot.
 	GetDiskPathAtSlot(ctx context.Context, vm *vmopv1.VirtualMachine, controllerType vmopv1.VirtualControllerType, controllerBusNumber, unitNumber int32) (string, error)
+
+	// IsDiskRetainedByAnySnapshot queries the live vCenter snapshot tree for the
+	// given VM and reports whether any snapshot — including unmanaged snapshots
+	// that have no VirtualMachineSnapshot CR — retains a virtual disk with the
+	// given backing UUID. This is the authoritative retention check; it must be
+	// used as the final backstop after the fast-path managed-snapshot check.
+	IsDiskRetainedByAnySnapshot(ctx context.Context, vm *vmopv1.VirtualMachine, diskUUID string) (bool, error)
 }

@@ -227,3 +227,102 @@ func findVolumeStatusEntry(
 	}
 	return nil
 }
+
+// IsDiskRetainedByAnySnapshot queries the live vCenter snapshot tree for the
+// given VM and reports whether any snapshot — including unmanaged snapshots
+// that have no VirtualMachineSnapshot CR — retains a virtual disk with the
+// given backing UUID. This is the authoritative retention check covering
+// unmanaged snapshots that are invisible to the managed-snapshot fast path.
+func (vs *vSphereVMProvider) IsDiskRetainedByAnySnapshot(
+	ctx context.Context,
+	vm *vmopv1.VirtualMachine,
+	diskUUID string) (bool, error) {
+
+	if diskUUID == "" {
+		return false, nil
+	}
+
+	vmCtx := pkgctx.NewVirtualMachineContext(
+		pkgctx.WithVCOpID(ctx, vm, "isDiskRetainedByAnySnapshot"),
+		vm,
+	)
+
+	client, err := vs.getVcClient(vmCtx)
+	if err != nil {
+		return false, fmt.Errorf("failed to get vCenter client: %w", err)
+	}
+
+	vcVM, err := vs.getVM(vmCtx, client, true)
+	if err != nil {
+		return false, fmt.Errorf("failed to get VM from vCenter: %w", err)
+	}
+
+	// Fetch the VM's snapshot tree.
+	var moVM mo.VirtualMachine
+	if err := vcVM.Properties(vmCtx, vcVM.Reference(), []string{"snapshot"}, &moVM); err != nil {
+		return false, fmt.Errorf("failed to fetch VM snapshot tree: %w", err)
+	}
+
+	if moVM.Snapshot == nil || len(moVM.Snapshot.RootSnapshotList) == 0 {
+		return false, nil
+	}
+
+	// Walk every snapshot node in the tree and check whether the disk UUID
+	// appears in its hardware device list. This covers unmanaged snapshots
+	// (created outside vm-operator) that have no VirtualMachineSnapshot CR.
+	retained, err := isDiskInSnapshotTree(vmCtx, vcVM, moVM.Snapshot.RootSnapshotList, diskUUID)
+	if err != nil {
+		return false, fmt.Errorf("failed to walk snapshot tree: %w", err)
+	}
+
+	return retained, nil
+}
+
+// isDiskInSnapshotTree recursively walks the snapshot tree rooted at nodes
+// and returns true if any snapshot retains a VirtualDisk whose backing UUID
+// equals diskUUID.
+func isDiskInSnapshotTree(
+	ctx pkgctx.VirtualMachineContext,
+	vcVM *object.VirtualMachine,
+	nodes []vimtypes.VirtualMachineSnapshotTree,
+	diskUUID string) (bool, error) {
+
+	for i := range nodes {
+		node := &nodes[i]
+
+		var moSnap mo.VirtualMachineSnapshot
+		if err := vcVM.Properties(ctx, node.Snapshot, []string{"config.hardware.device"}, &moSnap); err != nil {
+			// Log and continue: a single unreadable snapshot should not abort the check.
+			ctx.Logger.V(4).Info("Failed to fetch snapshot device config, skipping node",
+				"snapshot", node.Snapshot.Value, "error", err.Error())
+			continue
+		}
+
+		for _, dev := range moSnap.Config.Hardware.Device {
+			disk, ok := dev.(*vimtypes.VirtualDisk)
+			if !ok {
+				continue
+			}
+			backing, ok := disk.Backing.(*vimtypes.VirtualDiskFlatVer2BackingInfo)
+			if !ok {
+				continue
+			}
+			if backing.Uuid == diskUUID {
+				return true, nil
+			}
+		}
+
+		// Recurse into child snapshots.
+		if len(node.ChildSnapshotList) > 0 {
+			found, err := isDiskInSnapshotTree(ctx, vcVM, node.ChildSnapshotList, diskUUID)
+			if err != nil {
+				return false, err
+			}
+			if found {
+				return true, nil
+			}
+		}
+	}
+
+	return false, nil
+}

@@ -505,6 +505,11 @@ func (s *VMProvider) GetDiskPathAtSlot(_ context.Context, _ *vmopv1.VirtualMachi
 	return "", nil
 }
 
+// IsDiskRetainedByAnySnapshot is a no-op stub for the fake provider.
+func (s *VMProvider) IsDiskRetainedByAnySnapshot(_ context.Context, _ *vmopv1.VirtualMachine, _ string) (bool, error) {
+	return false, nil
+}
+
 func NewVMProvider() *VMProvider {
 	provider := VMProvider{
 		vmMap:    map[client.ObjectKey]*vmopv1.VirtualMachine{},
