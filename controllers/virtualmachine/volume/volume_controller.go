@@ -321,6 +321,12 @@ func (r *Reconciler) ReconcileNormal(ctx *pkgctx.VolumeContext) error {
 		return nil
 	}
 
+	// Greenfield VMs use the CsiVolumeInfo-based ownership path. Bypass the
+	// legacy CnsNodeVmAttachment path entirely for these VMs.
+	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes && vmopv1util.IsGreenfieldVM(ctx.VM) {
+		return r.reconcileGreenfieldVolumes(ctx)
+	}
+
 	attachments, err := r.getAttachmentsForVM(ctx)
 	if err != nil {
 		ctx.Logger.Error(err, "Error getting existing CnsNodeVmAttachments for VM")

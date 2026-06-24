@@ -91,4 +91,16 @@ type VirtualMachineProviderInterface interface {
 	GetSnapshotSize(ctx context.Context, vmSnapshotName string, vm *vmopv1.VirtualMachine) (int64, error)
 	// SyncVMSnapshotTreeStatus syncs the VM's current and root snapshots status.
 	SyncVMSnapshotTreeStatus(ctx context.Context, vm *vmopv1.VirtualMachine) error
+
+	// AttachOrphanedDiskToVM adds an existing VMDK (identified by its datastore
+	// path) to the virtual machine as a plain disk without creating a new virtual
+	// disk. This is used for the VM-owned volume attach path where the FCD has
+	// been unregistered and the VMDK must be re-attached to the VM.
+	AttachOrphanedDiskToVM(ctx context.Context, vm *vmopv1.VirtualMachine, diskPath string) error
+
+	// DetachDiskAtSlot removes the virtual disk at the given SCSI/controller
+	// slot from the virtual machine without deleting the underlying VMDK file.
+	// The slot is identified by controllerType, controllerBusNumber, and
+	// unitNumber as recorded in vm.status.volumes.
+	DetachDiskAtSlot(ctx context.Context, vm *vmopv1.VirtualMachine, controllerType vmopv1.VirtualControllerType, controllerBusNumber, unitNumber int32) (diskPath string, retErr error)
 }

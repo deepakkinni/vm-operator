@@ -484,6 +484,16 @@ func (s *VMProvider) SyncVMSnapshotTreeStatus(ctx context.Context, vm *vmopv1.Vi
 	return nil
 }
 
+// AttachOrphanedDiskToVM is a no-op stub for the fake provider.
+func (s *VMProvider) AttachOrphanedDiskToVM(_ context.Context, _ *vmopv1.VirtualMachine, _ string) error {
+	return nil
+}
+
+// DetachDiskAtSlot is a no-op stub for the fake provider.
+func (s *VMProvider) DetachDiskAtSlot(_ context.Context, _ *vmopv1.VirtualMachine, _ vmopv1.VirtualControllerType, _, _ int32) (string, error) {
+	return "", nil
+}
+
 func NewVMProvider() *VMProvider {
 	provider := VMProvider{
 		vmMap:    map[client.ObjectKey]*vmopv1.VirtualMachine{},
