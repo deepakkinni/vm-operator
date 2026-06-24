@@ -37,6 +37,7 @@ import (
 	vpcv1alpha1 "github.com/vmware-tanzu/nsx-operator/pkg/apis/vpc/v1alpha1"
 
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
+	cnsv1alpha1 "github.com/vmware-tanzu/vm-operator/external/vsphere-csi-driver/api/v1alpha1"
 	vmopv1common "github.com/vmware-tanzu/vm-operator/api/v1alpha6/common"
 	"github.com/vmware-tanzu/vm-operator/api/v1alpha6/sysprep"
 	ncpv1alpha1 "github.com/vmware-tanzu/vm-operator/external/ncp/api/v1alpha1"
@@ -161,6 +162,8 @@ var (
 // +kubebuilder:rbac:groups=vmoperator.vmware.com,resources=virtualmachines,verbs=get;list
 // +kubebuilder:rbac:groups=vmoperator.vmware.com,resources=virtualmachines/status,verbs=get
 // +kubebuilder:rbac:groups=netoperator.vmware.com,resources=networksettings,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get
+// +kubebuilder:rbac:groups=cns.vmware.com,resources=csivolumeinfos,verbs=get
 
 // AddToManager adds the webhook to the provided manager.
 func AddToManager(ctx *pkgctx.ControllerManagerContext, mgr ctrlmgr.Manager) error {
@@ -1610,6 +1613,19 @@ func (v validator) validateVolumes(
 				oldVolumesMap[vol.Name],
 				vol,
 				volPath)...)
+
+		// For UPDATE requests only: validate that newly-added PVC volumes with
+		// Persistent diskMode are safe to attach on a greenfield (VM-owned) VM.
+		if oldVM != nil &&
+			oldVolumesMap[vol.Name] == nil &&
+			pkgcfg.FromContext(ctx).Features.VMOwnedVolumes &&
+			metav1.HasAnnotation(vm.ObjectMeta, pkgconst.VMOwnedVolumesAnnotation) &&
+			vol.PersistentVolumeClaim != nil &&
+			(vol.DiskMode == "" || vol.DiskMode == vmopv1.VolumeDiskModePersistent) {
+
+			allErrs = append(allErrs,
+				validateGreenfieldVolumeAttach(ctx, v.client, vm, vol, volPath)...)
+		}
 
 	}
 
@@ -3664,4 +3680,88 @@ func isFirstClassNICAdvancedProperty(key string) bool {
 
 func isNetworkDeviceProperty(key string) bool {
 	return ethernetDeviceKeyRE.MatchString(key)
+}
+
+// validateGreenfieldVolumeAttach validates a volume being added to a greenfield VM.
+// It rejects the addition if a CsiVolumeInfo CR already has a spec.vms entry for
+// a different VM (RWO concurrent attach protection).
+func validateGreenfieldVolumeAttach(
+	ctx *pkgctx.WebhookRequestContext,
+	c ctrlclient.Client,
+	vm *vmopv1.VirtualMachine,
+	vol vmopv1.VirtualMachineVolume,
+	fieldPath *field.Path,
+) field.ErrorList {
+
+	var allErrs field.ErrorList
+
+	// Fetch the PVC to resolve its backing PV.
+	pvc := &corev1.PersistentVolumeClaim{}
+	if err := c.Get(ctx, ctrlclient.ObjectKey{
+		Namespace: vm.Namespace,
+		Name:      vol.PersistentVolumeClaim.ClaimName,
+	}, pvc); err != nil {
+		if apierrors.IsNotFound(err) {
+			// PVC not yet bound — nothing to check.
+			return allErrs
+		}
+		allErrs = append(allErrs, field.InternalError(fieldPath, err))
+		return allErrs
+	}
+
+	// PVC must be bound to a PV to look up the volume handle.
+	pvName := pvc.Spec.VolumeName
+	if pvName == "" {
+		// PVC is not yet bound; nothing to check.
+		return allErrs
+	}
+
+	// Fetch the PV to obtain the CSI volume handle.
+	pv := &corev1.PersistentVolume{}
+	if err := c.Get(ctx, ctrlclient.ObjectKey{Name: pvName}, pv); err != nil {
+		if apierrors.IsNotFound(err) {
+			return allErrs
+		}
+		allErrs = append(allErrs, field.InternalError(fieldPath, err))
+		return allErrs
+	}
+
+	if pv.Spec.CSI == nil {
+		// Not a CSI volume; no CVI to check.
+		return allErrs
+	}
+
+	volumeID := pv.Spec.CSI.VolumeHandle
+	if volumeID == "" {
+		return allErrs
+	}
+
+	// Construct the CsiVolumeInfo CR name and look it up.
+	cviName := pkgconst.CVINamePrefix + volumeID
+	cvi := &cnsv1alpha1.CsiVolumeInfo{}
+	if err := c.Get(ctx, ctrlclient.ObjectKey{
+		Namespace: pkgconst.CVISystemNamespace,
+		Name:      cviName,
+	}, cvi); err != nil {
+		if apierrors.IsNotFound(err) {
+			// No CVI yet — volume is not claimed by any VM. Allow.
+			return allErrs
+		}
+		allErrs = append(allErrs, field.InternalError(fieldPath, err))
+		return allErrs
+	}
+
+	// If any VM entry in the CVI belongs to a different VM, reject the attach.
+	for _, entry := range cvi.Spec.VMs {
+		if entry.VMName != vm.Name {
+			allErrs = append(allErrs, field.Invalid(
+				fieldPath,
+				vol.Name,
+				"PVC is already attached to another VM",
+			))
+			break
+		}
+	}
+
+	return allErrs
 }
