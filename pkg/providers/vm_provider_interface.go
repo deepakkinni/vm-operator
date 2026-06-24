@@ -17,6 +17,7 @@ import (
 
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
 	infrav1 "github.com/vmware-tanzu/vm-operator/external/infra/api/v1alpha1"
+	backupapi "github.com/vmware-tanzu/vm-operator/pkg/backup/api"
 	"github.com/vmware-tanzu/vm-operator/pkg/util/vsphere/client"
 )
 
@@ -91,4 +92,34 @@ type VirtualMachineProviderInterface interface {
 	GetSnapshotSize(ctx context.Context, vmSnapshotName string, vm *vmopv1.VirtualMachine) (int64, error)
 	// SyncVMSnapshotTreeStatus syncs the VM's current and root snapshots status.
 	SyncVMSnapshotTreeStatus(ctx context.Context, vm *vmopv1.VirtualMachine) error
+
+	// AttachOrphanedDiskToVM adds an existing VMDK (identified by its datastore
+	// path) to the virtual machine as a plain disk without creating a new virtual
+	// disk. This is used for the VM-owned volume attach path where the FCD has
+	// been unregistered and the VMDK must be re-attached to the VM.
+	AttachOrphanedDiskToVM(ctx context.Context, vm *vmopv1.VirtualMachine, diskPath string) error
+
+	// DetachDiskAtSlot removes the virtual disk at the given SCSI/controller
+	// slot from the virtual machine without deleting the underlying VMDK file.
+	// The slot is identified by controllerType, controllerBusNumber, and
+	// unitNumber as recorded in vm.status.volumes.
+	DetachDiskAtSlot(ctx context.Context, vm *vmopv1.VirtualMachine, controllerType vmopv1.VirtualControllerType, controllerBusNumber, unitNumber int32) (diskPath string, retErr error)
+
+	// GetPVCDiskDataFromSnapshot reads the PVCDiskData ExtraConfig key from the
+	// named vSphere snapshot and returns the decoded list of PVC-backed disk
+	// entries. Returns an empty slice (not an error) if the snapshot has no
+	// PVCDiskData key or if the VM does not have the VMOwnedVolumes annotation.
+	GetPVCDiskDataFromSnapshot(ctx context.Context, vm *vmopv1.VirtualMachine, snapshotName string) ([]backupapi.PVCDiskData, error)
+
+	// GetDiskPathAtSlot returns the datastore path of the virtual disk at the
+	// given controller slot without detaching it. Returns an error if no disk
+	// is found at that slot.
+	GetDiskPathAtSlot(ctx context.Context, vm *vmopv1.VirtualMachine, controllerType vmopv1.VirtualControllerType, controllerBusNumber, unitNumber int32) (string, error)
+
+	// IsDiskRetainedByAnySnapshot queries the live vCenter snapshot tree for the
+	// given VM and reports whether any snapshot — including unmanaged snapshots
+	// that have no VirtualMachineSnapshot CR — retains a virtual disk with the
+	// given backing UUID. This is the authoritative retention check; it must be
+	// used as the final backstop after the fast-path managed-snapshot check.
+	IsDiskRetainedByAnySnapshot(ctx context.Context, vm *vmopv1.VirtualMachine, diskUUID string) (bool, error)
 }

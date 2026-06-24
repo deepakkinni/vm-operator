@@ -10,15 +10,20 @@ import (
 
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlmgr "sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
+	cnsv1alpha1 "github.com/vmware-tanzu/vm-operator/external/vsphere-csi-driver/api/v1alpha1"
 	"github.com/vmware-tanzu/vm-operator/pkg/builder"
+	pkgcfg "github.com/vmware-tanzu/vm-operator/pkg/config"
+	pkgconst "github.com/vmware-tanzu/vm-operator/pkg/constants"
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/constants"
 	"github.com/vmware-tanzu/vm-operator/webhooks/common"
@@ -27,9 +32,13 @@ import (
 const (
 	webHookName = "default"
 
-	operationNotAllowedOnPVC = "%s operation on PVC with instance storage label is not allowed"
-	addingISLabelNotAllowed  = "adding instance storage label is not allowed"
+	operationNotAllowedOnPVC    = "%s operation on PVC with instance storage label is not allowed"
+	addingISLabelNotAllowed     = "adding instance storage label is not allowed"
+	vmManagedPVCDeleteDeniedFmt = "cannot delete PVC %s: volume is VM-managed; detach from all VMs and delete retaining snapshots first"
 )
+
+// +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get
+// +kubebuilder:rbac:groups=cns.vmware.com,resources=csivolumeinfos,verbs=get
 
 var (
 	labelPath                            = field.NewPath("metadata", "labels").Key(constants.InstanceStorageLabelKey)
@@ -56,7 +65,7 @@ func AddToManager(ctx *pkgctx.ControllerManagerContext, mgr ctrlmgr.Manager) err
 }
 
 // NewValidator returns the package's Validator.
-func NewValidator(client client.Client) builder.Validator {
+func NewValidator(client ctrlclient.Client) builder.Validator {
 	return validator{
 		client: client,
 		// TODO BMV Use the Context.scheme instead
@@ -65,7 +74,7 @@ func NewValidator(client client.Client) builder.Validator {
 }
 
 type validator struct {
-	client    client.Client
+	client    ctrlclient.Client
 	converter runtime.UnstructuredConverter
 }
 
@@ -100,7 +109,66 @@ func (v validator) ValidateDelete(ctx *pkgctx.WebhookRequestContext) admission.R
 			fmt.Sprintf(operationNotAllowedOnPVC, admissionv1.Delete)))
 	}
 
+	// Block deletion of PVCs whose associated CsiVolumeInfo has VMManaged
+	// ownership, unless the VMOwnedVolumes feature gate is disabled.
+	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes {
+		if denied, msg := v.isVMOwnedPVCDeleteDenied(ctx); denied {
+			fieldErrs = append(fieldErrs, field.Forbidden(field.NewPath("spec"), msg))
+		}
+	}
+
 	return common.BuildValidationResponse(ctx, nil, convertToStringArray(fieldErrs), nil)
+}
+
+// isVMOwnedPVCDeleteDenied returns true with a denial message when the PVC is
+// backed by a CsiVolumeInfo that has status.ownership == VMManaged.
+func (v validator) isVMOwnedPVCDeleteDenied(ctx *pkgctx.WebhookRequestContext) (bool, string) {
+	// ctx.Obj is *unstructured.Unstructured. Extract the fields we need.
+	pvcName := ctx.Obj.GetName()
+
+	// spec.volumeName is the bound PV name.
+	pvName, _, _ := unstructured.NestedString(ctx.Obj.Object, "spec", "volumeName")
+	if pvName == "" {
+		// Unbound PVC — no volume handle to look up.
+		return false, ""
+	}
+
+	// Get the PV to extract the CSI volume handle.
+	pv := &corev1.PersistentVolume{}
+	if err := v.client.Get(ctx, ctrlclient.ObjectKey{Name: pvName}, pv); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, ""
+		}
+		ctx.Logger.Error(err, "failed to get PV for VM-owned PVC check", "pv", pvName)
+		return false, ""
+	}
+
+	if pv.Spec.CSI == nil || pv.Spec.CSI.VolumeHandle == "" {
+		return false, ""
+	}
+
+	volumeID := pv.Spec.CSI.VolumeHandle
+	cviName := pkgconst.CVINamePrefix + volumeID
+
+	cvi := &cnsv1alpha1.CsiVolumeInfo{}
+	if err := v.client.Get(ctx, ctrlclient.ObjectKey{
+		Namespace: pkgconst.CVISystemNamespace,
+		Name:      cviName,
+	}, cvi); err != nil {
+		if apierrors.IsNotFound(err) {
+			// No CsiVolumeInfo tracking this volume — allow.
+			return false, ""
+		}
+		ctx.Logger.Error(err, "failed to get CsiVolumeInfo for VM-owned PVC check",
+			"cvi", cviName)
+		return false, ""
+	}
+
+	if cvi.Status.Ownership == cnsv1alpha1.OwnershipVMManaged {
+		return true, fmt.Sprintf(vmManagedPVCDeleteDeniedFmt, pvcName)
+	}
+
+	return false, ""
 }
 
 func (v validator) ValidateUpdate(ctx *pkgctx.WebhookRequestContext) admission.Response {
