@@ -274,4 +274,8 @@ const (
 	// CVINamePrefix is the prefix used to construct a CsiVolumeInfo CR name
 	// from the CNS volume ID. The full name is CVINamePrefix + volumeID.
 	CVINamePrefix = "cns-volume-"
+
+	// CVICleanupFinalizer is placed on greenfield VMs to ensure CsiVolumeInfo
+	// entries referencing the VM are cleaned up before the VM CR is deleted.
+	CVICleanupFinalizer = "vmoperator.vmware.com/cvi-cleanup"
 )

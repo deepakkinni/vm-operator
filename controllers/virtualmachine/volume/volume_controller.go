@@ -280,11 +280,17 @@ func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (_ ctr
 	return vmopv1util.ShouldRequeueForInstanceStoragePVCs(volCtx, volCtx.VM), nil
 }
 
-func (r *Reconciler) ReconcileDelete(_ *pkgctx.VolumeContext) error {
-	// Do nothing here since we depend on the Garbage Collector to do the deletion of the
+func (r *Reconciler) ReconcileDelete(ctx *pkgctx.VolumeContext) error {
+	// For greenfield VMs, clean up CsiVolumeInfo entries that reference this VM
+	// before allowing the VM CR to be deleted.
+	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes && vmopv1util.IsGreenfieldVM(ctx.VM) {
+		return r.reconcileGreenfieldDelete(ctx)
+	}
+
+	// For non-greenfield VMs, depend on the Garbage Collector to clean up
 	// dependent CNSNodeVMAttachment objects when their owning VM is deleted.
-	// We require the Volume provider to handle the situation where the VM is deleted before
-	// the volumes are detached & removed.
+	// The Volume provider handles the case where the VM is deleted before
+	// volumes are detached & removed.
 	return nil
 }
 

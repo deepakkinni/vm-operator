@@ -10,9 +10,11 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
 	cnsv1alpha1 "github.com/vmware-tanzu/vm-operator/external/vsphere-csi-driver/api/v1alpha1"
+	pkgconst "github.com/vmware-tanzu/vm-operator/pkg/constants"
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
 	pkgerr "github.com/vmware-tanzu/vm-operator/pkg/errors"
 	vmopv1util "github.com/vmware-tanzu/vm-operator/pkg/util/vmopv1"
@@ -24,6 +26,16 @@ import (
 // (detach).
 func (r *Reconciler) reconcileGreenfieldVolumes(ctx *pkgctx.VolumeContext) error {
 	vm := ctx.VM
+
+	// Ensure the CVI cleanup finalizer is present so that CsiVolumeInfo entries
+	// are cleaned up before the VM CR is garbage-collected.
+	if !controllerutil.ContainsFinalizer(vm, pkgconst.CVICleanupFinalizer) {
+		controllerutil.AddFinalizer(vm, pkgconst.CVICleanupFinalizer)
+		ctx.Logger.Info("Added CVICleanupFinalizer to greenfield VM")
+		// Return immediately so the patch helper persists the finalizer before
+		// any further reconciliation.
+		return nil
+	}
 
 	// Build a set of volume names currently in spec for quick lookup.
 	specVolumeNames := make(map[string]struct{}, len(vm.Spec.Volumes))
@@ -229,6 +241,60 @@ func (r *Reconciler) removeVolumeStatus(ctx *pkgctx.VolumeContext, name string) 
 		}
 	}
 	ctx.VM.Status.Volumes = volumes
+}
+
+// reconcileGreenfieldDelete cleans up CsiVolumeInfo entries for a greenfield VM
+// that is being deleted. It removes this VM's entry from each CVI that still
+// references it, then removes the CVICleanupFinalizer so the VM CR can be
+// garbage-collected.
+func (r *Reconciler) reconcileGreenfieldDelete(ctx *pkgctx.VolumeContext) error {
+	vm := ctx.VM
+
+	if !controllerutil.ContainsFinalizer(vm, pkgconst.CVICleanupFinalizer) {
+		// Nothing to clean up — finalizer already removed.
+		return nil
+	}
+
+	ctx.Logger.Info("Reconciling greenfield VM deletion: cleaning up CsiVolumeInfo entries")
+
+	for _, vol := range vm.Spec.Volumes {
+		if vol.PersistentVolumeClaim == nil {
+			continue
+		}
+
+		claimName := vol.PersistentVolumeClaim.ClaimName
+		cvi, err := vmopv1util.GetCVIForPVC(ctx, r.Client, vm.Namespace, claimName)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				ctx.Logger.Info("CsiVolumeInfo not found for PVC during VM deletion — skipping",
+					"pvc", claimName)
+				continue
+			}
+			return fmt.Errorf("failed to get CsiVolumeInfo for PVC %s during VM deletion: %w",
+				claimName, err)
+		}
+
+		if !vmopv1util.HasVMEntry(cvi, vm.Name) {
+			// Already removed.
+			continue
+		}
+
+		patch := ctrlclient.MergeFrom(cvi.DeepCopy())
+		cvi.Spec.VMs = removeVMEntry(cvi.Spec.VMs, vm.Name)
+		if err := r.Client.Patch(ctx, cvi, patch); err != nil {
+			return fmt.Errorf("failed to patch CsiVolumeInfo for PVC %s during VM deletion: %w",
+				claimName, err)
+		}
+
+		ctx.Logger.Info("Removed VM entry from CsiVolumeInfo during VM deletion",
+			"pvc", claimName, "cvi", cvi.Name)
+	}
+
+	// All CVI entries cleaned up — remove the finalizer so the VM CR can be deleted.
+	controllerutil.RemoveFinalizer(vm, pkgconst.CVICleanupFinalizer)
+	ctx.Logger.Info("Removed CVICleanupFinalizer from greenfield VM")
+
+	return nil
 }
 
 // removeVMEntry returns a new slice with the entry for vmName removed.
