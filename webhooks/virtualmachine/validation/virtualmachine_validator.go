@@ -37,10 +37,10 @@ import (
 	vpcv1alpha1 "github.com/vmware-tanzu/nsx-operator/pkg/apis/vpc/v1alpha1"
 
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
-	cnsv1alpha1 "github.com/vmware-tanzu/vm-operator/external/vsphere-csi-driver/api/v1alpha1"
 	vmopv1common "github.com/vmware-tanzu/vm-operator/api/v1alpha6/common"
 	"github.com/vmware-tanzu/vm-operator/api/v1alpha6/sysprep"
 	ncpv1alpha1 "github.com/vmware-tanzu/vm-operator/external/ncp/api/v1alpha1"
+	cnsv1alpha1 "github.com/vmware-tanzu/vm-operator/external/vsphere-csi-driver/api/v1alpha1"
 	"github.com/vmware-tanzu/vm-operator/pkg/builder"
 	pkgcfg "github.com/vmware-tanzu/vm-operator/pkg/config"
 	pkgconst "github.com/vmware-tanzu/vm-operator/pkg/constants"
@@ -3751,7 +3751,14 @@ func validateOwnedVolumeAttach(
 		return allErrs
 	}
 
-	// If any VM entry in the CVI belongs to a different VM, reject the attach.
+	// RWM volumes in dependent-persistent mode may be attached to multiple VMs
+	// simultaneously (spec §4.1.5), so the concurrent-attach rejection applies
+	// only to RWO volumes. A PVC that advertises ReadWriteMany is exempt.
+	if slices.Contains(pvc.Spec.AccessModes, corev1.ReadWriteMany) {
+		return allErrs
+	}
+
+	// RWO: if any VM entry in the CVI belongs to a different VM, reject the attach.
 	for _, entry := range cvi.Spec.VMs {
 		if entry.VMName != vm.Name {
 			allErrs = append(allErrs, field.Invalid(

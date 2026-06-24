@@ -37,14 +37,20 @@ func (r *Reconciler) reconcileOwnedVolumes(ctx *pkgctx.VolumeContext) error {
 		return nil
 	}
 
-	// Build a set of volume names currently in spec for quick lookup.
-	specVolumeNames := make(map[string]struct{}, len(vm.Spec.Volumes))
+	// Build a set of PVC claim names currently referenced by spec.volumes for
+	// quick lookup. Detach is driven off the CsiVolumeInfo entries that
+	// reference this VM whose PVC is no longer in spec, so the PVC claim name
+	// (not the volume name) is the correct key.
+	specClaimNames := make(map[string]struct{}, len(vm.Spec.Volumes))
 	for _, vol := range vm.Spec.Volumes {
-		specVolumeNames[vol.Name] = struct{}{}
+		if vol.PersistentVolumeClaim != nil {
+			specClaimNames[vol.PersistentVolumeClaim.ClaimName] = struct{}{}
+		}
 	}
 
-	// Workflow B — Detach volumes that are in status but NOT in spec.
-	if err := r.reconcileOwnedVolumeDetach(ctx, specVolumeNames); err != nil {
+	// Workflow B — Detach volumes referenced by a CsiVolumeInfo entry for this
+	// VM whose PVC is no longer in spec.volumes.
+	if err := r.reconcileOwnedVolumeDetach(ctx, specClaimNames); err != nil {
 		return err
 	}
 
@@ -140,92 +146,144 @@ func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error
 
 		ctx.Logger.Info("Added VM-owned disk to VM", "pvc", claimName, "diskPath", diskPath)
 
+		// Record the diskUUID from the CVI so that the detach path can correlate
+		// this VM status entry back to the CsiVolumeInfo after the volume is
+		// removed from spec.volumes. Slot info is observed by the VM controller
+		// on a later reconcile.
 		vm.Status.Volumes = append(vm.Status.Volumes, vmopv1.VirtualMachineVolumeStatus{
-			Name: vol.Name,
-			Type: vmopv1.VolumeTypeManaged,
+			Name:     vol.Name,
+			Type:     vmopv1.VolumeTypeManaged,
+			DiskUUID: cvi.Spec.DiskUUID,
 		})
 	}
 
 	return nil
 }
 
-// reconcileOwnedVolumeDetach processes Workflow B: for each volume in
-// status.volumes that is NOT in spec.volumes, detach the disk from the VM and
-// remove the VM entry from the CsiVolumeInfo.
+// reconcileOwnedVolumeDetach processes Workflow B: for each CsiVolumeInfo that
+// has a spec.vms entry for this VM but whose bound PVC is no longer referenced
+// by vm.spec.volumes, detach the disk from the VM and remove the VM entry from
+// the CsiVolumeInfo.
+//
+// Detach is driven off the CsiVolumeInfo entries (the PVC claim name carried in
+// spec.pvc), not the VM status volume name, because the volume name and the PVC
+// claim name are distinct and the removed volume is no longer present in
+// vm.spec.volumes to correlate the two.
 func (r *Reconciler) reconcileOwnedVolumeDetach(
 	ctx *pkgctx.VolumeContext,
-	specVolumeNames map[string]struct{}) error {
+	specClaimNames map[string]struct{}) error {
 
 	vm := ctx.VM
 
-	// Collect volumes in status that are no longer in spec.
-	var toDetach []vmopv1.VirtualMachineVolumeStatus
-	for _, vs := range vm.Status.Volumes {
-		if vs.Type != vmopv1.VolumeTypeManaged {
+	// List all CsiVolumeInfo CRs in the system namespace that have an entry for
+	// this VM. The CVI lives in the CSI system namespace, so the list is scoped
+	// there and then filtered by spec.pvcNamespace and spec.vms.
+	cviList := &cnsv1alpha1.CsiVolumeInfoList{}
+	if err := r.Client.List(ctx, cviList,
+		ctrlclient.InNamespace(pkgconst.CVISystemNamespace)); err != nil {
+		return fmt.Errorf("failed to list CsiVolumeInfo objects: %w", err)
+	}
+
+	for i := range cviList.Items {
+		cvi := &cviList.Items[i]
+
+		// Only consider CVIs for PVCs in this VM's namespace that reference this VM.
+		if cvi.Spec.PVCNamespace != vm.Namespace {
 			continue
 		}
-		if _, ok := specVolumeNames[vs.Name]; !ok {
-			toDetach = append(toDetach, vs)
+		if !vmopv1util.HasVMEntry(cvi, vm.Name) {
+			continue
+		}
+
+		// If the PVC is still referenced by vm.spec.volumes, the volume remains
+		// attached — nothing to detach.
+		if _, stillAttached := specClaimNames[cvi.Spec.PVC]; stillAttached {
+			continue
+		}
+
+		if err := r.detachOwnedVolume(ctx, cvi); err != nil {
+			return err
 		}
 	}
 
-	for _, vs := range toDetach {
-		// The volume name matches a spec volume name that no longer exists. To
-		// resolve the CVI we need the PVC claim name. The volume name IS the
-		// spec volume name, but we need the PVC claim name. Because the volume
-		// has been removed from spec we need to look it up via the status entry.
-		// The status entry doesn't store the PVC claim name directly, so we
-		// attempt lookup using the volume name as both volume-name and claim-name
-		// (a reasonable convention); if not found we skip.
-		cvi, err := vmopv1util.GetCVIForPVC(ctx, r.Client, vm.Namespace, vs.Name)
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				ctx.Logger.Info("CsiVolumeInfo not found for detach — skipping",
-					"volumeName", vs.Name)
-				r.removeVolumeStatus(ctx, vs.Name)
-				continue
-			}
-			return fmt.Errorf("failed to get CsiVolumeInfo for volume %s: %w", vs.Name, err)
-		}
+	return nil
+}
 
-		if !vmopv1util.HasVMEntry(cvi, vm.Name) {
-			// Already cleaned up — remove from status.
-			r.removeVolumeStatus(ctx, vs.Name)
-			continue
-		}
+// detachOwnedVolume detaches the disk backed by the given CsiVolumeInfo from the
+// VM (if still present), removes this VM's entry from the CVI, and clears the
+// corresponding VM status entry.
+func (r *Reconciler) detachOwnedVolume(
+	ctx *pkgctx.VolumeContext,
+	cvi *cnsv1alpha1.CsiVolumeInfo) error {
 
-		// Detach the disk from the VM.
-		if vs.ControllerBusNumber == nil || vs.UnitNumber == nil {
-			ctx.Logger.Info("Volume status missing slot info — skipping detach",
-				"volumeName", vs.Name)
-			continue
-		}
+	vm := ctx.VM
 
-		diskPath, err := r.VMProvider.DetachDiskAtSlot(
-			ctx, vm,
-			vs.ControllerType,
-			*vs.ControllerBusNumber,
-			*vs.UnitNumber,
-		)
-		if err != nil {
-			return fmt.Errorf("failed to detach disk for volume %s: %w", vs.Name, err)
-		}
+	// Correlate the CVI to the VM status entry via the disk UUID, which is
+	// recorded on both the CVI (spec.diskUUID) and the VM status volume
+	// (status.volumes[*].diskUUID). This is the only reliable correlation key
+	// once the volume has been removed from vm.spec.volumes.
+	statusEntry := r.findVolumeStatusByDiskUUID(ctx, cvi.Spec.DiskUUID)
 
-		ctx.Logger.Info("Removed VM-owned disk from VM", "volumeName", vs.Name, "diskPath", diskPath)
-
-		// Update CsiVolumeInfo: refresh diskPath if it changed, remove VM entry.
+	if statusEntry == nil ||
+		statusEntry.ControllerBusNumber == nil ||
+		statusEntry.UnitNumber == nil {
+		// The disk is not (or no longer) present on the VM, or slot info is not
+		// yet observed. Remove the VM entry from the CVI so CSI can re-register
+		// once all relationships are gone.
 		patch := ctrlclient.MergeFrom(cvi.DeepCopy())
-		if diskPath != "" && diskPath != cvi.Spec.DiskPath {
-			cvi.Spec.DiskPath = diskPath
-		}
 		cvi.Spec.VMs = removeVMEntry(cvi.Spec.VMs, vm.Name)
 		if err := r.Client.Patch(ctx, cvi, patch); err != nil {
-			return fmt.Errorf("failed to patch CsiVolumeInfo after detach for volume %s: %w", vs.Name, err)
+			return fmt.Errorf("failed to patch CsiVolumeInfo %s during detach: %w", cvi.Name, err)
 		}
-
-		r.removeVolumeStatus(ctx, vs.Name)
+		if statusEntry != nil {
+			r.removeVolumeStatus(ctx, statusEntry.Name)
+		}
+		return nil
 	}
 
+	diskPath, err := r.VMProvider.DetachDiskAtSlot(
+		ctx, vm,
+		statusEntry.ControllerType,
+		*statusEntry.ControllerBusNumber,
+		*statusEntry.UnitNumber,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to detach disk for CsiVolumeInfo %s: %w", cvi.Name, err)
+	}
+
+	ctx.Logger.Info("Removed VM-owned disk from VM",
+		"cvi", cvi.Name, "pvc", cvi.Spec.PVC, "diskPath", diskPath)
+
+	// Update CsiVolumeInfo: refresh diskPath if it changed, remove VM entry.
+	patch := ctrlclient.MergeFrom(cvi.DeepCopy())
+	if diskPath != "" && diskPath != cvi.Spec.DiskPath {
+		cvi.Spec.DiskPath = diskPath
+	}
+	cvi.Spec.VMs = removeVMEntry(cvi.Spec.VMs, vm.Name)
+	if err := r.Client.Patch(ctx, cvi, patch); err != nil {
+		return fmt.Errorf("failed to patch CsiVolumeInfo after detach for %s: %w", cvi.Name, err)
+	}
+
+	r.removeVolumeStatus(ctx, statusEntry.Name)
+
+	return nil
+}
+
+// findVolumeStatusByDiskUUID returns the managed VM status volume entry whose
+// DiskUUID matches the given UUID, or nil if none match (or the UUID is empty).
+func (r *Reconciler) findVolumeStatusByDiskUUID(
+	ctx *pkgctx.VolumeContext,
+	diskUUID string) *vmopv1.VirtualMachineVolumeStatus {
+
+	if diskUUID == "" {
+		return nil
+	}
+	for i := range ctx.VM.Status.Volumes {
+		vs := &ctx.VM.Status.Volumes[i]
+		if vs.Type == vmopv1.VolumeTypeManaged && vs.DiskUUID == diskUUID {
+			return vs
+		}
+	}
 	return nil
 }
 
@@ -255,37 +313,36 @@ func (r *Reconciler) reconcileOwnedVolumeDelete(ctx *pkgctx.VolumeContext) error
 
 	ctx.Logger.Info("Reconciling VM-owned-volumes VM deletion: cleaning up CsiVolumeInfo entries")
 
-	for _, vol := range vm.Spec.Volumes {
-		if vol.PersistentVolumeClaim == nil {
+	// Iterate ALL CsiVolumeInfo CRs that reference this VM (per spec §13.5.2),
+	// not just those for volumes still in vm.spec.volumes. A CVI entry may
+	// linger for a volume already removed from spec (e.g. snapshot-retained or
+	// an in-flight detach), and those must also be cleaned up before the VM CR
+	// is garbage-collected.
+	cviList := &cnsv1alpha1.CsiVolumeInfoList{}
+	if err := r.Client.List(ctx, cviList,
+		ctrlclient.InNamespace(pkgconst.CVISystemNamespace)); err != nil {
+		return fmt.Errorf("failed to list CsiVolumeInfo objects during VM deletion: %w", err)
+	}
+
+	for i := range cviList.Items {
+		cvi := &cviList.Items[i]
+
+		if cvi.Spec.PVCNamespace != vm.Namespace {
 			continue
 		}
-
-		claimName := vol.PersistentVolumeClaim.ClaimName
-		cvi, err := vmopv1util.GetCVIForPVC(ctx, r.Client, vm.Namespace, claimName)
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				ctx.Logger.Info("CsiVolumeInfo not found for PVC during VM deletion — skipping",
-					"pvc", claimName)
-				continue
-			}
-			return fmt.Errorf("failed to get CsiVolumeInfo for PVC %s during VM deletion: %w",
-				claimName, err)
-		}
-
 		if !vmopv1util.HasVMEntry(cvi, vm.Name) {
-			// Already removed.
 			continue
 		}
 
 		patch := ctrlclient.MergeFrom(cvi.DeepCopy())
 		cvi.Spec.VMs = removeVMEntry(cvi.Spec.VMs, vm.Name)
 		if err := r.Client.Patch(ctx, cvi, patch); err != nil {
-			return fmt.Errorf("failed to patch CsiVolumeInfo for PVC %s during VM deletion: %w",
-				claimName, err)
+			return fmt.Errorf("failed to patch CsiVolumeInfo %s during VM deletion: %w",
+				cvi.Name, err)
 		}
 
 		ctx.Logger.Info("Removed VM entry from CsiVolumeInfo during VM deletion",
-			"pvc", claimName, "cvi", cvi.Name)
+			"pvc", cvi.Spec.PVC, "cvi", cvi.Name)
 	}
 
 	// All CVI entries cleaned up — remove the finalizer so the VM CR can be deleted.
