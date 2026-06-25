@@ -154,10 +154,16 @@ func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error
 		// this VM status entry back to the CsiVolumeInfo after the volume is
 		// removed from spec.volumes. Slot info is observed by the VM controller
 		// on a later reconcile.
+		// Attached is set to true immediately: AttachOrphanedDiskToVM only
+		// returns here on a successful ReconfigVM, so the disk is physically
+		// present. session.reconcileVolumes gates power-on on Attached=true for
+		// every PVC-backed volume, so setting it here unblocks the first
+		// power-on after attach.
 		vm.Status.Volumes = append(vm.Status.Volumes, vmopv1.VirtualMachineVolumeStatus{
 			Name:     vol.Name,
 			Type:     vmopv1.VolumeTypeManaged,
 			DiskUUID: cvi.Spec.DiskUUID,
+			Attached: true,
 		})
 	}
 

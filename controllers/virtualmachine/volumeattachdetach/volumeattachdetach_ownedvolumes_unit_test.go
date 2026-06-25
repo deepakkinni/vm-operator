@@ -306,6 +306,7 @@ var _ = Describe(
 							cvi.Spec.VMs = []cnsv1alpha1.CsiVolumeInfoVMEntry{
 								{VMName: vmName},
 							}
+							cvi.Spec.DiskUUID = "disk-uuid-abc"
 							initObjects = append(initObjects, pvc, pv, cvi)
 
 							vm.Spec.Volumes = []vmopv1.VirtualMachineVolume{
@@ -323,12 +324,15 @@ var _ = Describe(
 							}
 						})
 
-						It("attaches the disk and adds a status entry", func() {
+						It("attaches the disk and adds a status entry with Attached=true", func() {
 							err := reconciler.ReconcileNormal(volCtx)
 							Expect(err).ToNot(HaveOccurred())
 							Expect(vm.Status.Volumes).To(HaveLen(1))
 							Expect(vm.Status.Volumes[0].Name).To(Equal("vol-persistent"))
 							Expect(vm.Status.Volumes[0].Type).To(Equal(vmopv1.VolumeTypeManaged))
+							Expect(vm.Status.Volumes[0].DiskUUID).To(Equal("disk-uuid-abc"))
+							Expect(vm.Status.Volumes[0].Attached).To(BeTrue(),
+								"Attached must be true after attach so reconcileVolumes does not block power-on")
 						})
 					})
 
@@ -500,6 +504,7 @@ var _ = Describe(
 							for _, v := range vm.Status.Volumes {
 								Expect(v.Type).To(Equal(vmopv1.VolumeTypeManaged))
 								Expect(v.DiskUUID).ToNot(BeEmpty())
+								Expect(v.Attached).To(BeTrue())
 							}
 						})
 					})
@@ -557,6 +562,7 @@ var _ = Describe(
 							Expect(vm.Status.Volumes).To(HaveLen(1))
 							Expect(vm.Status.Volumes[0].Name).To(Equal("vol-2"))
 							Expect(vm.Status.Volumes[0].DiskUUID).To(Equal("disk-uuid-222"))
+							Expect(vm.Status.Volumes[0].Attached).To(BeTrue())
 
 							// CVI for vol-1 must have been patched with the VM entry.
 							cvi1 := &cnsv1alpha1.CsiVolumeInfo{}
