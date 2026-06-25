@@ -2,7 +2,7 @@
 // The term "Broadcom" refers to Broadcom Inc. and/or its subsidiaries.
 // SPDX-License-Identifier: Apache-2.0
 
-package volume_test
+package volumeattachdetach_test
 
 import (
 	. "github.com/onsi/ginkgo/v2"
@@ -14,7 +14,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
-	"github.com/vmware-tanzu/vm-operator/controllers/virtualmachine/volume"
+	"github.com/vmware-tanzu/vm-operator/controllers/virtualmachine/volumeattachdetach"
 	cnsv1alpha1 "github.com/vmware-tanzu/vm-operator/external/vsphere-csi-driver/api/v1alpha1"
 	pkgcfg "github.com/vmware-tanzu/vm-operator/pkg/config"
 	pkgconst "github.com/vmware-tanzu/vm-operator/pkg/constants"
@@ -39,7 +39,7 @@ var _ = Describe(
 		var (
 			initObjects []client.Object
 			ctx         *builder.UnitTestContextForController
-			reconciler  *volume.Reconciler
+			reconciler  *volumeattachdetach.Reconciler
 			volCtx      *pkgctx.VolumeContext
 			vm          *vmopv1.VirtualMachine
 		)
@@ -72,7 +72,7 @@ var _ = Describe(
 					}).
 				Build()
 
-			reconciler = volume.NewReconciler(
+			reconciler = volumeattachdetach.NewReconciler(
 				ctx,
 				ctx.Client,
 				ctx.Logger,

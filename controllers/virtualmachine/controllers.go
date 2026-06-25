@@ -12,7 +12,7 @@ import (
 	"github.com/vmware-tanzu/vm-operator/controllers/virtualmachine/storagepolicyusage"
 	"github.com/vmware-tanzu/vm-operator/controllers/virtualmachine/virtualmachine"
 	"github.com/vmware-tanzu/vm-operator/controllers/virtualmachine/volume"
-	"github.com/vmware-tanzu/vm-operator/controllers/virtualmachine/volumebatch"
+	"github.com/vmware-tanzu/vm-operator/controllers/virtualmachine/volumeattachdetach"
 	pkgcfg "github.com/vmware-tanzu/vm-operator/pkg/config"
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
 )
@@ -27,8 +27,8 @@ func AddToManager(ctx *pkgctx.ControllerManagerContext, mgr manager.Manager) err
 	}
 
 	if pkgcfg.FromContext(ctx).Features.VMSharedDisks {
-		if err := volumebatch.AddToManager(ctx, mgr); err != nil {
-			return fmt.Errorf("failed to initialize Volume Batch controller: %w", err)
+		if err := volumeattachdetach.AddToManager(ctx, mgr); err != nil {
+			return fmt.Errorf("failed to initialize volume attach/detach controller: %w", err)
 		}
 	} else {
 		if err := volume.AddToManager(ctx, mgr); err != nil {
