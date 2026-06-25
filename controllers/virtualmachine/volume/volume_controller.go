@@ -280,17 +280,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (_ ctr
 	return vmopv1util.ShouldRequeueForInstanceStoragePVCs(volCtx, volCtx.VM), nil
 }
 
-func (r *Reconciler) ReconcileDelete(ctx *pkgctx.VolumeContext) error {
-	// For VM-owned-volumes VMs, clean up CsiVolumeInfo entries that reference this VM
-	// before allowing the VM CR to be deleted.
-	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes && vmopv1util.HasVMOwnedVolumesAnnotation(ctx.VM) {
-		return r.reconcileOwnedVolumeDelete(ctx)
-	}
-
-	// For non-VM-owned-volumes VMs, depend on the Garbage Collector to clean up
+func (r *Reconciler) ReconcileDelete(_ *pkgctx.VolumeContext) error {
+	// Do nothing here since we depend on the Garbage Collector to do the deletion of the
 	// dependent CNSNodeVMAttachment objects when their owning VM is deleted.
-	// The Volume provider handles the case where the VM is deleted before
-	// volumes are detached & removed.
+	// We require the Volume provider to handle the situation where the VM is deleted before
+	// the volumes are detached & removed.
 	return nil
 }
 
@@ -325,12 +319,6 @@ func (r *Reconciler) ReconcileNormal(ctx *pkgctx.VolumeContext) error {
 			ctx.Logger.Info("VM Status does not yet have BiosUUID. Deferring volume attachment")
 		}
 		return nil
-	}
-
-	// VMOwnedVolumes VMs use the CsiVolumeInfo-based ownership path. Bypass the
-	// legacy CnsNodeVmAttachment path entirely for these VMs.
-	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes && vmopv1util.HasVMOwnedVolumesAnnotation(ctx.VM) {
-		return r.reconcileOwnedVolumes(ctx)
 	}
 
 	attachments, err := r.getAttachmentsForVM(ctx)

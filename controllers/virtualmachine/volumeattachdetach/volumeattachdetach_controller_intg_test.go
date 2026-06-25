@@ -2,7 +2,7 @@
 // The term "Broadcom" refers to Broadcom Inc. and/or its subsidiaries.
 // SPDX-License-Identifier: Apache-2.0
 
-package volumebatch_test
+package volumeattachdetach_test
 
 import (
 	. "github.com/onsi/ginkgo/v2"
@@ -21,7 +21,7 @@ import (
 	cnsv1alpha1 "github.com/vmware-tanzu/vm-operator/external/vsphere-csi-driver/api/v1alpha1"
 
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
-	"github.com/vmware-tanzu/vm-operator/controllers/virtualmachine/volumebatch"
+	"github.com/vmware-tanzu/vm-operator/controllers/virtualmachine/volumeattachdetach"
 	pkgcfg "github.com/vmware-tanzu/vm-operator/pkg/config"
 	"github.com/vmware-tanzu/vm-operator/pkg/constants/testlabels"
 	"github.com/vmware-tanzu/vm-operator/pkg/patch"
@@ -665,7 +665,7 @@ func intgTestsReconcile() {
 
 				// Update status to simulate CSI marking it as deprecated (not attached).
 				legacyAttachment.Status.Attached = false
-				legacyAttachment.Status.Error = volumebatch.CNSNodeVMAttachmentDeprecatedErrorMsg
+				legacyAttachment.Status.Error = volumeattachdetach.CNSNodeVMAttachmentDeprecatedErrorMsg
 				Expect(ctx.Client.Status().Update(ctx, legacyAttachment)).To(Succeed())
 			})
 
@@ -734,7 +734,7 @@ func intgTestsInstanceStorage() {
 
 	Context("Instance Storage PVC Creation", func() {
 		It("should successfully create instance storage PVCs with correct labels", func() {
-			// The volumebatch controller watches all PVCs
+			// The volumeattachdetach controller watches all PVCs
 
 			// Create a VM with instance storage
 			vm := &vmopv1.VirtualMachine{

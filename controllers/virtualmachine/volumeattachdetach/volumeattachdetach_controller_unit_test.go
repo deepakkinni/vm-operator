@@ -2,7 +2,7 @@
 // The term "Broadcom" refers to Broadcom Inc. and/or its subsidiaries.
 // SPDX-License-Identifier: Apache-2.0
 
-package volumebatch_test
+package volumeattachdetach_test
 
 import (
 	"context"
@@ -28,7 +28,7 @@ import (
 	"github.com/vmware-tanzu/vm-operator/test/builder"
 
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
-	"github.com/vmware-tanzu/vm-operator/controllers/virtualmachine/volumebatch"
+	"github.com/vmware-tanzu/vm-operator/controllers/virtualmachine/volumeattachdetach"
 	pkgcfg "github.com/vmware-tanzu/vm-operator/pkg/config"
 	pkgconst "github.com/vmware-tanzu/vm-operator/pkg/constants"
 	"github.com/vmware-tanzu/vm-operator/pkg/constants/testlabels"
@@ -63,7 +63,7 @@ func unitTestsReconcile() {
 		detachingVolumeSuffix = ":detaching"
 	)
 	var (
-		reconciler     *volumebatch.Reconciler
+		reconciler     *volumeattachdetach.Reconciler
 		initObjects    []client.Object
 		withFuncs      interceptor.Funcs
 		ctx            *builder.UnitTestContextForController
@@ -170,7 +170,7 @@ func unitTestsReconcile() {
 				}).
 			Build()
 
-		reconciler = volumebatch.NewReconciler(
+		reconciler = volumeattachdetach.NewReconciler(
 			ctx,
 			ctx.Client,
 			ctx.Logger,
@@ -671,7 +671,7 @@ func unitTestsReconcile() {
 					legacyAttachment1.Spec.VolumeName = legacyPVCName1
 					// Add a volume that matches legacy attachment
 					legacyAttachment1.Status.Attached = false
-					legacyAttachment1.Status.Error = volumebatch.CNSNodeVMAttachmentDeprecatedErrorMsg
+					legacyAttachment1.Status.Error = volumeattachdetach.CNSNodeVMAttachmentDeprecatedErrorMsg
 
 					vm.Spec.Volumes = append(vm.Spec.Volumes, *vmVolWithLegacy1)
 					initObjects = append(initObjects, legacyAttachment1, legacyAttachment2, legacyPVC1)
@@ -690,7 +690,7 @@ func unitTestsReconcile() {
 					// Just expect that the error has been reflected in the status. This situation is
 					// a little different in that it kind of is :detaching, but it is still in the spec.
 					Expect(vm.Status.Volumes).To(HaveLen(1))
-					Expect(vm.Status.Volumes[0].Error).To(Equal(volumebatch.CNSNodeVMAttachmentDeprecatedErrorMsg))
+					Expect(vm.Status.Volumes[0].Error).To(Equal(volumeattachdetach.CNSNodeVMAttachmentDeprecatedErrorMsg))
 
 					err = reconciler.ReconcileNormal(volCtx)
 					Expect(err).ToNot(HaveOccurred())
