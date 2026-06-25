@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/vim25/mo"
 	vimtypes "github.com/vmware/govmomi/vim25/types"
 
@@ -84,16 +85,28 @@ func (vs *vSphereVMProvider) AttachOrphanedDiskToVM(
 	}
 	backing.FileName = diskPath
 
+	disk := &vimtypes.VirtualDisk{
+		VirtualDevice: vimtypes.VirtualDevice{
+			Backing: backing,
+		},
+	}
+
+	// Assign the disk to an existing disk controller (SCSI by default) so that
+	// vSphere accepts the device. Without a controller key and unit number the
+	// ReconfigVM call fails with "Device requires a controller".
+	devices := object.VirtualDeviceList(moVM.Config.Hardware.Device)
+	controller, err := devices.FindDiskController("")
+	if err != nil {
+		return fmt.Errorf("failed to find a disk controller on VM %q: %w", vm.Name, err)
+	}
+	devices.AssignController(disk, controller)
+
 	configSpec := &vimtypes.VirtualMachineConfigSpec{
 		DeviceChange: []vimtypes.BaseVirtualDeviceConfigSpec{
 			&vimtypes.VirtualDeviceConfigSpec{
 				Operation:     vimtypes.VirtualDeviceConfigSpecOperationAdd,
 				FileOperation: "", // empty = use existing file, do not create
-				Device: &vimtypes.VirtualDisk{
-					VirtualDevice: vimtypes.VirtualDevice{
-						Backing: backing,
-					},
-				},
+				Device:        disk,
 			},
 		},
 	}
