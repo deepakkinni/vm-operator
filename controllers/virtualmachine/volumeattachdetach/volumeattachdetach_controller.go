@@ -65,6 +65,32 @@ const (
 	CNSNodeVMAttachmentDeprecatedErrorMsg = "CnsNodeVMAttachment CR is deprecated. Please detach this PVC from the VM and then reattach it."
 )
 
+// cviToVirtualMachineMapper returns a mapper that, for a CsiVolumeInfo update,
+// enqueues every VirtualMachine listed in spec.vms. This ensures the CVI-based
+// attach path is triggered promptly when CSI sets the green signal (ownership
+// transition to VMManaged) rather than relying solely on the periodic requeue.
+func cviToVirtualMachineMapper() handler.TypedMapFunc[*cnsv1alpha1.CsiVolumeInfo, reconcile.Request] {
+	return func(_ context.Context, cvi *cnsv1alpha1.CsiVolumeInfo) []reconcile.Request {
+		ns := cvi.Spec.PVCNamespace
+		if ns == "" {
+			return nil
+		}
+		reqs := make([]reconcile.Request, 0, len(cvi.Spec.VMs))
+		for _, entry := range cvi.Spec.VMs {
+			if entry.VMName == "" {
+				continue
+			}
+			reqs = append(reqs, reconcile.Request{
+				NamespacedName: client.ObjectKey{
+					Namespace: ns,
+					Name:      entry.VMName,
+				},
+			})
+		}
+		return reqs
+	}
+}
+
 // AddToManager adds this package's controller to the provided manager.
 func AddToManager(ctx *pkgctx.ControllerManagerContext, mgr manager.Manager) error {
 	controllerNameShort := fmt.Sprintf("%s-controller", strings.ToLower(controllerName))
@@ -140,6 +166,21 @@ func AddToManager(ctx *pkgctx.ControllerManagerContext, mgr manager.Manager) err
 		return fmt.Errorf(
 			"failed to start VirtualMachine watch "+
 				"for CnsNodeVMBatchAttachment: %w", err)
+	}
+
+	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes {
+		// When a CsiVolumeInfo transitions to VMManaged (green signal set by CSI),
+		// enqueue the VMs listed in spec.vms so the CVI-based attach path runs
+		// without waiting for the 5-second requeue timer.
+		if err := c.Watch(source.Kind(
+			mgr.GetCache(),
+			&cnsv1alpha1.CsiVolumeInfo{},
+			handler.TypedEnqueueRequestsFromMapFunc(cviToVirtualMachineMapper()),
+		)); err != nil {
+			return fmt.Errorf(
+				"failed to start VirtualMachine watch "+
+					"for CsiVolumeInfo: %w", err)
+		}
 	}
 
 	if pkgcfg.FromContext(ctx).Features.AllDisksArePVCs {
@@ -231,6 +272,7 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=cns.vmware.com,resources=cnsnodevmbatchattachments,verbs=create;delete;get;list;watch;patch;update
 // +kubebuilder:rbac:groups=cns.vmware.com,resources=cnsnodevmbatchattachments/status,verbs=get;list
 // +kubebuilder:rbac:groups=cns.vmware.com,resources=cnsnodevmattachments,verbs=delete;get;list;watch
+// +kubebuilder:rbac:groups=cns.vmware.com,resources=csivolumeinfos,verbs=get;list;watch;patch;update
 
 // Reconcile reconciles a VirtualMachine object and processes the volumes for batch attachment.
 func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (_ ctrl.Result, reterr error) {
@@ -398,16 +440,28 @@ func (r *Reconciler) ReconcileNormal(ctx *pkgctx.VolumeContext) error {
 	}
 
 	// Process volumes and create/update batch attachment.
-	// filter Volume spec that doesn't cause error and return them
-	// for constructing the VM's volumeStatus.
-	filteredVolumeSpecsForBatch, processErr := r.processBatchAttachmentAndFilterVolumeSpecs(
-		ctx,
-		volumeSpecsForBatch,
-		batchAttachment,
+	// Skip batch processing only for VM-owned-volumes VMs that have no
+	// independent volumes to manage and no existing attachment to clean up.
+	// For all other VMs (including those with legacy attachments only) an
+	// empty CnsNodeVMBatchAttachment is created intentionally to signal CSI.
+	var (
+		filteredVolumeSpecsForBatch []cnsv1alpha1.VolumeSpec
+		processErr                  error
 	)
-	if processErr != nil {
-		ctx.Logger.Error(processErr, "Error processing CnsNodeVMBatchAttachments")
-		// Keep going to return aggregated error below.
+	skipBatch := pkgcfg.FromContext(ctx).Features.VMOwnedVolumes &&
+		vmopv1util.HasVMOwnedVolumesAnnotation(ctx.VM) &&
+		len(volumeSpecsForBatch) == 0 &&
+		batchAttachment == nil
+	if !skipBatch {
+		filteredVolumeSpecsForBatch, processErr = r.processBatchAttachmentAndFilterVolumeSpecs(
+			ctx,
+			volumeSpecsForBatch,
+			batchAttachment,
+		)
+		if processErr != nil {
+			ctx.Logger.Error(processErr, "Error processing CnsNodeVMBatchAttachments")
+			// Keep going to return aggregated error below.
+		}
 	}
 
 	// Record the volumes currently in status so we can log what's removed.

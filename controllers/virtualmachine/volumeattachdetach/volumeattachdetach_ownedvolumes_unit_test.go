@@ -5,6 +5,8 @@
 package volumeattachdetach_test
 
 import (
+	"errors"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
@@ -20,6 +22,8 @@ import (
 	pkgconst "github.com/vmware-tanzu/vm-operator/pkg/constants"
 	"github.com/vmware-tanzu/vm-operator/pkg/constants/testlabels"
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
+	pkgerr "github.com/vmware-tanzu/vm-operator/pkg/errors"
+	"github.com/vmware-tanzu/vm-operator/pkg/util/ptr"
 	vmopv1util "github.com/vmware-tanzu/vm-operator/pkg/util/vmopv1"
 	"github.com/vmware-tanzu/vm-operator/test/builder"
 )
@@ -51,7 +55,11 @@ var _ = Describe(
 					Namespace: ns,
 				},
 				Status: vmopv1.VirtualMachineStatus{
-					BiosUUID: "bios-uuid-1234",
+					BiosUUID:     "bios-uuid-1234",
+					InstanceUUID: "instance-uuid-1234",
+					// Hardware must be non-nil: the batch path in ReconcileNormal
+					// iterates Status.Hardware.Controllers.
+					Hardware: &vmopv1.VirtualMachineHardwareStatus{},
 				},
 			}
 		})
@@ -109,6 +117,10 @@ var _ = Describe(
 				},
 				Spec: corev1.PersistentVolumeClaimSpec{
 					VolumeName: pvNameArg,
+					// StorageClassName must be non-nil so the batch controller's
+					// handlePVCWithWFFC does not error. An empty string means "no
+					// storage class" and the WFFC check exits early.
+					StorageClassName: ptr.To(""),
 				},
 			}
 			pv := &corev1.PersistentVolume{
@@ -364,6 +376,196 @@ var _ = Describe(
 							err := reconciler.ReconcileNormal(volCtx)
 							Expect(err).ToNot(HaveOccurred())
 							Expect(vm.Status.Volumes).To(BeEmpty())
+						})
+					})
+
+					When("VM has multiple dependent volumes, none with a VM entry in their CVI", func() {
+						// Regression guard: old code patched only the first CVI and
+						// returned early, leaving the rest unpatched until the next
+						// reconcile. The new code must patch all in one pass.
+						const (
+							pvcName2 = "pvc-2"
+							pvName2  = "pv-2"
+							volID2   = "vol-id-def456"
+						)
+
+						BeforeEach(func() {
+							pvc1, pv1, cvi1 := buildPVCWithCVI(pvcName, pvName, volID)
+							pvc2, pv2, cvi2 := buildPVCWithCVI(pvcName2, pvName2, volID2)
+							// Neither CVI has a VM entry yet.
+							initObjects = append(initObjects, pvc1, pv1, cvi1, pvc2, pv2, cvi2)
+
+							vm.Spec.Volumes = []vmopv1.VirtualMachineVolume{
+								{
+									Name: "vol-1",
+									VirtualMachineVolumeSource: vmopv1.VirtualMachineVolumeSource{
+										PersistentVolumeClaim: &vmopv1.PersistentVolumeClaimVolumeSource{
+											PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+												ClaimName: pvcName,
+											},
+										},
+									},
+								},
+								{
+									Name: "vol-2",
+									VirtualMachineVolumeSource: vmopv1.VirtualMachineVolumeSource{
+										PersistentVolumeClaim: &vmopv1.PersistentVolumeClaimVolumeSource{
+											PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+												ClaimName: pvcName2,
+											},
+										},
+									},
+								},
+							}
+						})
+
+						It("patches all CVIs and returns a RequeueError", func() {
+							err := reconciler.ReconcileNormal(volCtx)
+
+							// Must requeue — CSI has not yet set the green signal.
+							var requeue pkgerr.RequeueError
+							Expect(errors.As(err, &requeue)).To(BeTrue(),
+								"expected a RequeueError, got: %v", err)
+
+							// Both CVIs must have the VM entry — not just the first one.
+							cvi1 := &cnsv1alpha1.CsiVolumeInfo{}
+							Expect(ctx.Client.Get(ctx, client.ObjectKey{
+								Name:      vmopv1util.CVINameForVolumeID(volID),
+								Namespace: pkgconst.CVISystemNamespace,
+							}, cvi1)).To(Succeed())
+							Expect(vmopv1util.HasVMEntry(cvi1, vm.Name)).To(BeTrue(),
+								"CVI for vol-1 should have VM entry")
+
+							cvi2 := &cnsv1alpha1.CsiVolumeInfo{}
+							Expect(ctx.Client.Get(ctx, client.ObjectKey{
+								Name:      vmopv1util.CVINameForVolumeID(volID2),
+								Namespace: pkgconst.CVISystemNamespace,
+							}, cvi2)).To(Succeed())
+							Expect(vmopv1util.HasVMEntry(cvi2, vm.Name)).To(BeTrue(),
+								"CVI for vol-2 should have VM entry")
+						})
+					})
+
+					When("VM has multiple dependent volumes, all green with VM entries present", func() {
+						const (
+							pvcName2 = "pvc-2"
+							pvName2  = "pv-2"
+							volID2   = "vol-id-def456"
+						)
+
+						BeforeEach(func() {
+							pvc1, pv1, cvi1 := buildPVCWithCVI(pvcName, pvName, volID)
+							pvc2, pv2, cvi2 := buildPVCWithCVI(pvcName2, pvName2, volID2)
+							// Pre-set VM entries and distinct DiskUUIDs on both CVIs.
+							cvi1.Spec.VMs = []cnsv1alpha1.CsiVolumeInfoVMEntry{{VMName: vm.Name}}
+							cvi1.Spec.DiskUUID = "disk-uuid-111"
+							cvi2.Spec.VMs = []cnsv1alpha1.CsiVolumeInfoVMEntry{{VMName: vm.Name}}
+							cvi2.Spec.DiskUUID = "disk-uuid-222"
+							initObjects = append(initObjects, pvc1, pv1, cvi1, pvc2, pv2, cvi2)
+
+							vm.Spec.Volumes = []vmopv1.VirtualMachineVolume{
+								{
+									Name: "vol-1",
+									VirtualMachineVolumeSource: vmopv1.VirtualMachineVolumeSource{
+										PersistentVolumeClaim: &vmopv1.PersistentVolumeClaimVolumeSource{
+											PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+												ClaimName: pvcName,
+											},
+										},
+									},
+								},
+								{
+									Name: "vol-2",
+									VirtualMachineVolumeSource: vmopv1.VirtualMachineVolumeSource{
+										PersistentVolumeClaim: &vmopv1.PersistentVolumeClaimVolumeSource{
+											PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+												ClaimName: pvcName2,
+											},
+										},
+									},
+								},
+							}
+						})
+
+						It("attaches all disks and returns nil", func() {
+							err := reconciler.ReconcileNormal(volCtx)
+							Expect(err).ToNot(HaveOccurred())
+
+							Expect(vm.Status.Volumes).To(HaveLen(2))
+							names := []string{
+								vm.Status.Volumes[0].Name,
+								vm.Status.Volumes[1].Name,
+							}
+							Expect(names).To(ConsistOf("vol-1", "vol-2"))
+							for _, v := range vm.Status.Volumes {
+								Expect(v.Type).To(Equal(vmopv1.VolumeTypeManaged))
+								Expect(v.DiskUUID).ToNot(BeEmpty())
+							}
+						})
+					})
+
+					When("VM has a mix: one green volume and one missing VM entry", func() {
+						// The earlier not-ready volume must not block the later green one.
+						const (
+							pvcName2 = "pvc-2"
+							pvName2  = "pv-2"
+							volID2   = "vol-id-def456"
+						)
+
+						BeforeEach(func() {
+							pvc1, pv1, cvi1 := buildPVCWithCVI(pvcName, pvName, volID)
+							pvc2, pv2, cvi2 := buildPVCWithCVI(pvcName2, pvName2, volID2)
+							// vol-1: no VM entry (needs patching, not yet green).
+							// vol-2: VM entry present, green signal already set.
+							cvi2.Spec.VMs = []cnsv1alpha1.CsiVolumeInfoVMEntry{{VMName: vm.Name}}
+							cvi2.Spec.DiskUUID = "disk-uuid-222"
+							initObjects = append(initObjects, pvc1, pv1, cvi1, pvc2, pv2, cvi2)
+
+							vm.Spec.Volumes = []vmopv1.VirtualMachineVolume{
+								{
+									Name: "vol-1",
+									VirtualMachineVolumeSource: vmopv1.VirtualMachineVolumeSource{
+										PersistentVolumeClaim: &vmopv1.PersistentVolumeClaimVolumeSource{
+											PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+												ClaimName: pvcName,
+											},
+										},
+									},
+								},
+								{
+									Name: "vol-2",
+									VirtualMachineVolumeSource: vmopv1.VirtualMachineVolumeSource{
+										PersistentVolumeClaim: &vmopv1.PersistentVolumeClaimVolumeSource{
+											PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+												ClaimName: pvcName2,
+											},
+										},
+									},
+								},
+							}
+						})
+
+						It("attaches the green volume, patches the pending CVI, and requeues", func() {
+							err := reconciler.ReconcileNormal(volCtx)
+
+							// Must requeue because vol-1 is still pending.
+							var requeue pkgerr.RequeueError
+							Expect(errors.As(err, &requeue)).To(BeTrue(),
+								"expected a RequeueError, got: %v", err)
+
+							// vol-2 must be attached despite vol-1 not being ready.
+							Expect(vm.Status.Volumes).To(HaveLen(1))
+							Expect(vm.Status.Volumes[0].Name).To(Equal("vol-2"))
+							Expect(vm.Status.Volumes[0].DiskUUID).To(Equal("disk-uuid-222"))
+
+							// CVI for vol-1 must have been patched with the VM entry.
+							cvi1 := &cnsv1alpha1.CsiVolumeInfo{}
+							Expect(ctx.Client.Get(ctx, client.ObjectKey{
+								Name:      vmopv1util.CVINameForVolumeID(volID),
+								Namespace: pkgconst.CVISystemNamespace,
+							}, cvi1)).To(Succeed())
+							Expect(vmopv1util.HasVMEntry(cvi1, vm.Name)).To(BeTrue(),
+								"CVI for vol-1 should have VM entry after patch")
 						})
 					})
 				})

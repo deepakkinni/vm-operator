@@ -66,6 +66,11 @@ func (r *Reconciler) reconcileOwnedVolumes(ctx *pkgctx.VolumeContext) error {
 // that does not yet appear in status.volumes with an attached disk, write the
 // VM entry to the CsiVolumeInfo spec.vms and, once CSI signals green, attach
 // the disk directly to the VM via ReconfigVM.
+//
+// All dependent-persistent volumes are processed in a single pass. Volumes
+// whose CVI is not yet ready (entry just patched, or green signal absent) set
+// needRequeue and continue — they do not block later volumes that are ready.
+// A single RequeueError is returned at the end if any volume is still pending.
 func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error {
 
 	vm := ctx.VM
@@ -77,6 +82,8 @@ func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error
 			statusVolumeNames[vs.Name] = struct{}{}
 		}
 	}
+
+	needRequeue := false
 
 	for _, vol := range vm.Spec.Volumes {
 		if vol.PersistentVolumeClaim == nil {
@@ -107,7 +114,9 @@ func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error
 		}
 
 		if !vmopv1util.HasVMEntry(cvi, vm.Name) {
-			// Append this VM to spec.vms and patch.
+			// Append this VM to spec.vms and patch. CSI will react and update
+			// status (ownership transfer / green signal). Continue processing
+			// remaining volumes — other CVIs are independent.
 			patch := ctrlclient.MergeFrom(cvi.DeepCopy())
 			cvi.Spec.VMs = append(cvi.Spec.VMs, cnsv1alpha1.CsiVolumeInfoVMEntry{
 				VMName:         vm.Name,
@@ -118,20 +127,15 @@ func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error
 			}
 			ctx.Logger.Info("Appended VM entry to CsiVolumeInfo spec.vms for attach",
 				"pvc", claimName, "cvi", cvi.Name)
-			// Requeue — CSI will react and update status.
-			return pkgerr.RequeueError{
-				After:   5 * time.Second,
-				Message: "waiting for CSI to process CsiVolumeInfo spec.vms update",
-			}
+			needRequeue = true
+			continue
 		}
 
 		if !vmopv1util.IsGreenSignal(cvi) {
 			ctx.Logger.Info("Waiting for CSI to unregister volume (green signal not yet present)",
 				"pvc", claimName, "cvi", cvi.Name)
-			return pkgerr.RequeueError{
-				After:   5 * time.Second,
-				Message: "waiting for CSI green signal on CsiVolumeInfo",
-			}
+			needRequeue = true
+			continue
 		}
 
 		// Green signal present — attach the disk to the VM.
@@ -155,6 +159,13 @@ func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error
 			Type:     vmopv1.VolumeTypeManaged,
 			DiskUUID: cvi.Spec.DiskUUID,
 		})
+	}
+
+	if needRequeue {
+		return pkgerr.RequeueError{
+			After:   5 * time.Second,
+			Message: "waiting for CSI to process CsiVolumeInfo updates",
+		}
 	}
 
 	return nil
