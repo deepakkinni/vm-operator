@@ -64,9 +64,10 @@ type CsiVolumeInfoSpec struct {
 	// +required
 	VolumeID string `json:"volumeID"`
 
-	// PVC is the name of the bound PersistentVolumeClaim.
+	// PVCName is the name of the bound PersistentVolumeClaim. The JSON tag must
+	// be "pvcName" to match the CsiVolumeInfo CRD served by CSI.
 	// +optional
-	PVC string `json:"pvc,omitempty"`
+	PVCName string `json:"pvcName,omitempty"`
 
 	// PVCNamespace is the namespace of the bound PersistentVolumeClaim. The
 	// CsiVolumeInfo CR itself lives in CsiVolumeInfoNamespace.
