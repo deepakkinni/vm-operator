@@ -363,6 +363,119 @@ var _ = Describe("Reconcile", func() {
 			})
 		})
 
+		Context("VM-owned dependent disk backed by a non-placeholder PVC", func() {
+
+			// A dependent VM-owned volume is attached as a plain VMDK (its FCD
+			// is unregistered during ownership transfer), so it survives the
+			// FCD filter and would otherwise be misdetected as an unmanaged
+			// classic disk. Its PVC is user/CSI-provisioned (no dataSourceRef
+			// pointing at the VM), so the register plugin must leave it alone
+			// when VMOwnedVolumes is enabled.
+			const pvcName = "user-pvc"
+
+			BeforeEach(func() {
+				withObjs = append(withObjs,
+					&corev1.PersistentVolumeClaim{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: vm.Namespace,
+							Name:      pvcName,
+						},
+						Spec: corev1.PersistentVolumeClaimSpec{
+							StorageClassName: ptr.To("my-storage-class-1"),
+							VolumeName:       "pv-user",
+						},
+						Status: corev1.PersistentVolumeClaimStatus{
+							Phase: corev1.ClaimBound,
+						},
+					})
+
+				vm.Spec.Volumes = []vmopv1.VirtualMachineVolume{
+					{
+						Name: "my-disk",
+						VirtualMachineVolumeSource: vmopv1.VirtualMachineVolumeSource{
+							PersistentVolumeClaim: &vmopv1.PersistentVolumeClaimVolumeSource{
+								PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: pvcName,
+								},
+							},
+						},
+						ControllerType:      vmopv1.VirtualControllerTypeSCSI,
+						ControllerBusNumber: ptr.To(int32(1)),
+						UnitNumber:          ptr.To(int32(0)),
+					},
+				}
+
+				disk := &vimtypes.VirtualDisk{
+					VirtualDevice: vimtypes.VirtualDevice{
+						Key:           300,
+						ControllerKey: 200,
+						UnitNumber:    ptr.To(int32(0)),
+						Backing: &vimtypes.VirtualDiskFlatVer2BackingInfo{
+							VirtualDeviceFileBackingInfo: vimtypes.VirtualDeviceFileBackingInfo{
+								FileName: "[LocalDS_0] vm1/my-disk.vmdk",
+							},
+							Uuid: "user-disk-uuid",
+						},
+					},
+					CapacityInBytes: 1 * 1024 * 1024 * 1024,
+				}
+				scsiController := &vimtypes.VirtualSCSIController{
+					VirtualController: vimtypes.VirtualController{
+						VirtualDevice: vimtypes.VirtualDevice{
+							Key: 200,
+						},
+						BusNumber: 1,
+					},
+				}
+				moVM.Config = &vimtypes.VirtualMachineConfigInfo{
+					Hardware: vimtypes.VirtualHardware{
+						Device: []vimtypes.BaseVirtualDevice{
+							scsiController,
+							disk,
+						},
+					},
+				}
+			})
+
+			JustBeforeEach(func() {
+				pkgcfg.SetContext(ctx, func(config *pkgcfg.Config) {
+					config.Features.VMOwnedVolumes = true
+					config.Features.VMSharedDisks = true
+				})
+			})
+
+			It("should not register or mutate the managed PVC", func() {
+				Expect(unmanagedvolsreg.Reconcile(
+					ctx,
+					k8sClient,
+					vimClient,
+					vm,
+					moVM,
+					configSpec)).To(Succeed())
+
+				// The bound, user-provisioned PVC must be left untouched: no
+				// dataSourceRef and no VM ownerReference were added.
+				var pvc corev1.PersistentVolumeClaim
+				Expect(k8sClient.Get(ctx, ctrlclient.ObjectKey{
+					Namespace: vm.Namespace,
+					Name:      pvcName,
+				}, &pvc)).To(Succeed())
+				Expect(pvc.Spec.DataSourceRef).To(BeNil())
+				Expect(pvc.OwnerReferences).To(BeEmpty())
+
+				// No CnsRegisterVolume should be created for a managed disk.
+				var crvList cnsv1alpha1.CnsRegisterVolumeList
+				Expect(k8sClient.List(ctx, &crvList,
+					ctrlclient.InNamespace(vm.Namespace))).To(Succeed())
+				Expect(crvList.Items).To(BeEmpty())
+
+				// The condition reflects that registration is complete.
+				cond := pkgcond.Get(vm, unmanagedvolsreg.Condition)
+				Expect(cond).ToNot(BeNil())
+				Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			})
+		})
+
 		Context("PVC creation and management", func() {
 
 			When("VM has unmanaged disks with no sharing", func() {
