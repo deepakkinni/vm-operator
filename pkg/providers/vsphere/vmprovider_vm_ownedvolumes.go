@@ -15,6 +15,7 @@ import (
 
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
+	ctxop "github.com/vmware-tanzu/vm-operator/pkg/context/operation"
 	res "github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/resources"
 )
 
@@ -28,6 +29,10 @@ func (vs *vSphereVMProvider) AttachOrphanedDiskToVM(
 	ctx context.Context,
 	vm *vmopv1.VirtualMachine,
 	diskPath string) error {
+
+	// Initialise the operation context so that resVM.Reconfigure can call
+	// ctxop.MarkUpdate without panicking. Mirrors backup.go:223.
+	ctx = ctxop.WithContext(ctx)
 
 	vmCtx := pkgctx.NewVirtualMachineContext(
 		pkgctx.WithVCOpID(ctx, vm, "attachOrphanedDisk"),
@@ -110,6 +115,10 @@ func (vs *vSphereVMProvider) DetachDiskAtSlot(
 	vm *vmopv1.VirtualMachine,
 	controllerType vmopv1.VirtualControllerType,
 	controllerBusNumber, unitNumber int32) (string, error) {
+
+	// Initialise the operation context so that resVM.Reconfigure can call
+	// ctxop.MarkUpdate without panicking. Mirrors backup.go:223.
+	ctx = ctxop.WithContext(ctx)
 
 	vmCtx := pkgctx.NewVirtualMachineContext(
 		pkgctx.WithVCOpID(ctx, vm, "detachDiskAtSlot"),
