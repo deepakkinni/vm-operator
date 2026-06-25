@@ -208,7 +208,7 @@ func (r *Reconciler) reconcileOwnedVolumeDetach(
 
 		// If the PVC is still referenced by vm.spec.volumes, the volume remains
 		// attached — nothing to detach.
-		if _, stillAttached := specClaimNames[cvi.Spec.PVC]; stillAttached {
+		if _, stillAttached := specClaimNames[cvi.Spec.PVCName]; stillAttached {
 			continue
 		}
 
@@ -263,7 +263,7 @@ func (r *Reconciler) detachOwnedVolume(
 	}
 
 	ctx.Logger.Info("Removed VM-owned disk from VM",
-		"cvi", cvi.Name, "pvc", cvi.Spec.PVC, "diskPath", diskPath)
+		"cvi", cvi.Name, "pvc", cvi.Spec.PVCName, "diskPath", diskPath)
 
 	// Update CsiVolumeInfo: refresh diskPath if it changed, remove VM entry.
 	patch := ctrlclient.MergeFrom(cvi.DeepCopy())
@@ -353,7 +353,7 @@ func (r *Reconciler) reconcileOwnedVolumeDelete(ctx *pkgctx.VolumeContext) error
 		}
 
 		ctx.Logger.Info("Removed VM entry from CsiVolumeInfo during VM deletion",
-			"pvc", cvi.Spec.PVC, "cvi", cvi.Name)
+			"pvc", cvi.Spec.PVCName, "cvi", cvi.Name)
 	}
 
 	// All CVI entries cleaned up — remove the finalizer so the VM CR can be deleted.
