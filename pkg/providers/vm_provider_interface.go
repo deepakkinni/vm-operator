@@ -122,4 +122,11 @@ type VirtualMachineProviderInterface interface {
 	// given backing UUID. This is the authoritative retention check; it must be
 	// used as the final backstop after the fast-path managed-snapshot check.
 	IsDiskRetainedByAnySnapshot(ctx context.Context, vm *vmopv1.VirtualMachine, diskUUID string) (bool, error)
+
+	// GetDiskPathFromSnapshot returns the base VMDK datastore path for the
+	// disk with the given UUID from the named vSphere snapshot's device config.
+	// The path is resolved to the root ancestor (past any redo-log delta
+	// suffixes) so it is directly usable for CNS registerDisk. Must be called
+	// BEFORE DeleteSnapshot while the snapshot config is still accessible.
+	GetDiskPathFromSnapshot(ctx context.Context, vm *vmopv1.VirtualMachine, snapshotName, diskUUID string) (string, error)
 }

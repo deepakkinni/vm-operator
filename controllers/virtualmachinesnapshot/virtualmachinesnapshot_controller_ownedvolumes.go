@@ -12,10 +12,71 @@ import (
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
+	cnsv1alpha1 "github.com/vmware-tanzu/vm-operator/external/vsphere-csi-driver/api/v1alpha1"
 	backupapi "github.com/vmware-tanzu/vm-operator/pkg/backup/api"
+	pkgconst "github.com/vmware-tanzu/vm-operator/pkg/constants"
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
 	vmopv1util "github.com/vmware-tanzu/vm-operator/pkg/util/vmopv1"
 )
+
+// refreshCVIDiskPathsFromSnapshot resolves the base VMDK path for each
+// PVC-backed disk from the named snapshot's device config and updates the
+// corresponding CsiVolumeInfo.spec.diskPath. This must be called BEFORE the
+// vSphere snapshot is deleted so the snapshot config is still readable. It
+// implements spec §10.2 D.2: ensure CVI carries the registerable base-disk
+// path before the snapshot is removed and CSI triggers a re-registration.
+func (r *Reconciler) refreshCVIDiskPathsFromSnapshot(
+	ctx *pkgctx.VirtualMachineSnapshotContext,
+	vm *vmopv1.VirtualMachine,
+	pvcDisks []backupapi.PVCDiskData) {
+
+	vmSnapshot := ctx.VirtualMachineSnapshot
+
+	for _, disk := range pvcDisks {
+		if disk.UUID == "" {
+			continue
+		}
+
+		diskPath, err := r.VMProvider.GetDiskPathFromSnapshot(
+			ctx.Context, vm, vmSnapshot.Name, disk.UUID)
+		if err != nil {
+			ctx.Logger.V(4).Info("Could not resolve base disk path from snapshot, skipping CVI diskPath refresh",
+				"pvcName", disk.PVCName, "diskUUID", disk.UUID, "error", err.Error())
+			continue
+		}
+		if diskPath == "" {
+			continue
+		}
+
+		// Look up the CVI directly by the disk UUID (= CNS volume ID = FCD UUID),
+		// which is deterministic and avoids the PVC → PV → volumeHandle chain.
+		cvi := &cnsv1alpha1.CsiVolumeInfo{}
+		cviKey := ctrlclient.ObjectKey{
+			Namespace: pkgconst.CVISystemNamespace,
+			Name:      vmopv1util.CVINameForVolumeID(disk.UUID),
+		}
+		if err := r.Client.Get(ctx, cviKey, cvi); err != nil {
+			ctx.Logger.V(4).Info("CVI not found for disk UUID, skipping diskPath refresh",
+				"pvcName", disk.PVCName, "diskUUID", disk.UUID, "error", err.Error())
+			continue
+		}
+
+		if cvi.Spec.DiskPath == diskPath {
+			continue
+		}
+
+		patch := ctrlclient.MergeFrom(cvi.DeepCopy())
+		cvi.Spec.DiskPath = diskPath
+		if err := r.Client.Patch(ctx, cvi, patch); err != nil {
+			ctx.Logger.Error(err, "Failed to refresh CVI diskPath from snapshot",
+				"pvcName", disk.PVCName, "diskPath", diskPath)
+			continue
+		}
+
+		ctx.Logger.Info("Refreshed CVI diskPath from snapshot device config",
+			"pvcName", disk.PVCName, "diskPath", diskPath)
+	}
+}
 
 // reconcileOwnedVolumeSnapshotDeletion evaluates CsiVolumeInfo entries for
 // vm-owned volumes retained by the snapshot being deleted. It removes a

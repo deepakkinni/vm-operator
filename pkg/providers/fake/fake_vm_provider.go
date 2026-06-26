@@ -71,6 +71,7 @@ type funcs struct {
 
 	GetPVCDiskDataFromSnapshotFn  func(ctx context.Context, vm *vmopv1.VirtualMachine, snapshotName string) ([]backupapi.PVCDiskData, error)
 	IsDiskRetainedByAnySnapshotFn func(ctx context.Context, vm *vmopv1.VirtualMachine, diskUUID string) (bool, error)
+	GetDiskPathFromSnapshotFn     func(ctx context.Context, vm *vmopv1.VirtualMachine, snapshotName, diskUUID string) (string, error)
 }
 
 type VMProvider struct {
@@ -521,6 +522,16 @@ func (s *VMProvider) IsDiskRetainedByAnySnapshot(ctx context.Context, vm *vmopv1
 		return s.IsDiskRetainedByAnySnapshotFn(ctx, vm, diskUUID)
 	}
 	return false, nil
+}
+
+// GetDiskPathFromSnapshot delegates to GetDiskPathFromSnapshotFn if set.
+func (s *VMProvider) GetDiskPathFromSnapshot(ctx context.Context, vm *vmopv1.VirtualMachine, snapshotName, diskUUID string) (string, error) {
+	s.Lock()
+	defer s.Unlock()
+	if s.GetDiskPathFromSnapshotFn != nil {
+		return s.GetDiskPathFromSnapshotFn(ctx, vm, snapshotName, diskUUID)
+	}
+	return "", nil
 }
 
 func NewVMProvider() *VMProvider {

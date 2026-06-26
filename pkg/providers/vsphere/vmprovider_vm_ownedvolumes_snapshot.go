@@ -18,8 +18,8 @@ import (
 	backupapi "github.com/vmware-tanzu/vm-operator/pkg/backup/api"
 	pkgcfg "github.com/vmware-tanzu/vm-operator/pkg/config"
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
-	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/virtualmachine"
 	res "github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/resources"
+	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/virtualmachine"
 	pkgutil "github.com/vmware-tanzu/vm-operator/pkg/util"
 	vmopv1util "github.com/vmware-tanzu/vm-operator/pkg/util/vmopv1"
 )
@@ -122,6 +122,70 @@ func (vs *vSphereVMProvider) GetDiskPathAtSlot(
 	}
 
 	return diskPath, nil
+}
+
+// GetDiskPathFromSnapshot returns the base VMDK datastore path for the disk
+// with the given UUID as recorded in the named vSphere snapshot's device
+// config. The returned path is walked to the root ancestor (past any
+// redo-log delta suffixes) so it can be used directly as the registerDisk
+// path for CNS. This must be called BEFORE DeleteSnapshot so the snapshot
+// config is still accessible. It implements spec §10.2 D.2.
+func (vs *vSphereVMProvider) GetDiskPathFromSnapshot(
+	ctx context.Context,
+	vm *vmopv1.VirtualMachine,
+	snapshotName, diskUUID string) (string, error) {
+
+	if diskUUID == "" {
+		return "", fmt.Errorf("diskUUID must not be empty")
+	}
+
+	vmCtx := pkgctx.NewVirtualMachineContext(
+		pkgctx.WithVCOpID(ctx, vm, "getDiskPathFromSnapshot"),
+		vm,
+	)
+
+	client, err := vs.getVcClient(vmCtx)
+	if err != nil {
+		return "", fmt.Errorf("failed to get vCenter client: %w", err)
+	}
+
+	vcVM, err := vs.getVM(vmCtx, client, true)
+	if err != nil {
+		return "", fmt.Errorf("failed to get VM from vCenter: %w", err)
+	}
+
+	var moVM mo.VirtualMachine
+	if err := vcVM.Properties(vmCtx, vcVM.Reference(), []string{"snapshot"}, &moVM); err != nil {
+		return "", fmt.Errorf("failed to fetch VM snapshot properties: %w", err)
+	}
+
+	snapNode, err := virtualmachine.FindSnapshot(moVM, snapshotName)
+	if err != nil {
+		return "", fmt.Errorf("failed to find snapshot %q: %w", snapshotName, err)
+	}
+
+	var moSnap mo.VirtualMachineSnapshot
+	if err := vcVM.Properties(vmCtx, snapNode.Snapshot, []string{"config.hardware.device"}, &moSnap); err != nil {
+		return "", fmt.Errorf("failed to fetch snapshot config for %q: %w", snapshotName, err)
+	}
+
+	for _, dev := range moSnap.Config.Hardware.Device {
+		disk, ok := dev.(*vimtypes.VirtualDisk)
+		if !ok {
+			continue
+		}
+		backing, ok := disk.Backing.(*vimtypes.VirtualDiskFlatVer2BackingInfo)
+		if !ok {
+			continue
+		}
+		if backing.Uuid == diskUUID {
+			// Walk to root: snapshot configs may themselves point to a delta
+			// if the disk existed through prior snapshots.
+			return rootBackingFileName(backing), nil
+		}
+	}
+
+	return "", fmt.Errorf("disk UUID %q not found in snapshot %q device config", diskUUID, snapshotName)
 }
 
 // captureDroppedVolumeDiskPaths records the current VMDK datastore paths for

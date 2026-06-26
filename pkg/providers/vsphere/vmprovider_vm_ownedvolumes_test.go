@@ -6,6 +6,8 @@ package vsphere
 
 import (
 	"testing"
+
+	vimtypes "github.com/vmware/govmomi/vim25/types"
 )
 
 func TestNormalizeBackingFileName(t *testing.T) {
@@ -51,6 +53,63 @@ func TestNormalizeBackingFileName(t *testing.T) {
 			got := normalizeBackingFileName(tc.input)
 			if got != tc.expected {
 				t.Errorf("normalizeBackingFileName(%q)\n  got:  %q\n  want: %q", tc.input, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestRootBackingFileName(t *testing.T) {
+	mkBacking := func(fileName string, parent *vimtypes.VirtualDiskFlatVer2BackingInfo) *vimtypes.VirtualDiskFlatVer2BackingInfo {
+		return &vimtypes.VirtualDiskFlatVer2BackingInfo{
+			VirtualDeviceFileBackingInfo: vimtypes.VirtualDeviceFileBackingInfo{FileName: fileName},
+			Parent:                       parent,
+		}
+	}
+
+	tests := []struct {
+		name     string
+		backing  *vimtypes.VirtualDiskFlatVer2BackingInfo
+		expected string
+	}{
+		{
+			name:     "no parent — base disk returned as-is",
+			backing:  mkBacking("[ds] vm/disk.vmdk", nil),
+			expected: "[ds] vm/disk.vmdk",
+		},
+		{
+			name: "one level of delta — parent returned",
+			backing: mkBacking(
+				"[ds] vm/disk-000001.vmdk",
+				mkBacking("[ds] vm/disk.vmdk", nil),
+			),
+			expected: "[ds] vm/disk.vmdk",
+		},
+		{
+			name: "two levels of delta — grandparent returned",
+			backing: mkBacking(
+				"[ds] vm/disk-000002.vmdk",
+				mkBacking(
+					"[ds] vm/disk-000001.vmdk",
+					mkBacking("[ds] vm/disk.vmdk", nil),
+				),
+			),
+			expected: "[ds] vm/disk.vmdk",
+		},
+		{
+			name: "https URL parent is normalised",
+			backing: mkBacking(
+				"[ds] vm/disk-000001.vmdk",
+				mkBacking("https://vc.example.com/folder/vm/disk.vmdk?dcPath=%2Fdc1&dsName=ds", nil),
+			),
+			expected: "[ds] vm/disk.vmdk",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := rootBackingFileName(tc.backing)
+			if got != tc.expected {
+				t.Errorf("rootBackingFileName()\n  got:  %q\n  want: %q", got, tc.expected)
 			}
 		})
 	}

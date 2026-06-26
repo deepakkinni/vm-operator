@@ -270,6 +270,14 @@ func (r *Reconciler) ReconcileDelete(ctx *pkgctx.VirtualMachineSnapshotContext) 
 			ctx.Logger.Error(readErr, "Failed to read PVC disk data from snapshot before deletion")
 			// Non-fatal: proceed; CVI entries won't be cleaned up this cycle.
 		}
+
+		// D.2: Refresh each CVI's spec.diskPath from the snapshot's hardware
+		// device config BEFORE deleting the snapshot. This resolves any
+		// redo-log delta suffix and ensures CSI receives the registerable base
+		// VMDK path when it re-registers the disk after this snapshot is gone.
+		if len(pvcDisks) > 0 {
+			r.refreshCVIDiskPathsFromSnapshot(ctx, vm, pvcDisks)
+		}
 	}
 
 	// delete snapshot from the VM
