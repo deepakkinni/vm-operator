@@ -50,6 +50,28 @@ spec:
                   BackingType enumerates types of backing for batch attach operations.
                   These values correspond to the CnsVolumeBackingType enum.
                 type: string
+              deferFcdRegistration:
+                description: |-
+                  DeferFcdRegistration instructs the controller to create Kubernetes
+                  bookkeeping (PV and CsiVolumeInfo) using the PVC UID as the volume
+                  identity, without registering an FCD or creating a CNS DB entry.
+                  Used when the disk is already attached as a plain VMDK on an imported VM.
+                type: boolean
+              diskUUID:
+                description: |-
+                  DiskUUID is the VirtualDisk backing UUID (VirtualDisk.Backing.Uuid).
+                  Informational only — not used as a correlation key.
+                type: string
+              vmInstanceUUID:
+                description: |-
+                  VMInstanceUUID is the instance UUID of the owning VM.
+                  Required when DeferFcdRegistration is true.
+                type: string
+              vmName:
+                description: |-
+                  VMName is the name of the VirtualMachine CR that owns this disk.
+                  Required when DeferFcdRegistration is true.
+                type: string
               diskURLPath:
                 description: |-
                   DiskUrlPath is URL path to an existing block volume to be imported into
@@ -94,6 +116,15 @@ spec:
                   The last error encountered during import operation, if any.
                   This field must only be set by the entity completing the import
                   operation, i.e. the CNS Operator.
+                type: string
+              pvName:
+                description: |-
+                  PvName is the name of the PersistentVolume created by the controller.
+                type: string
+              volumeID:
+                description: |-
+                  VolumeID is the volume identity assigned by the controller.
+                  For deferred-FCD imports this equals the PVC UID.
                 type: string
               registered:
                 description: |-

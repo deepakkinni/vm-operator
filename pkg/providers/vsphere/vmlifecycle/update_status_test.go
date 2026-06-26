@@ -3051,6 +3051,199 @@ var _ = Describe("UpdateStatus", func() {
 					}))
 				})
 			})
+
+			When("VMOwnedVolumes is enabled and a non-FCD disk maps to a PVC-backed spec.volumes entry", func() {
+				// Verifies that an imported disk (no FCD, already attached as a plain VMDK,
+				// but backed by a PVC via spec.volumes) is reported as Managed rather than Classic.
+				BeforeEach(func() {
+					pkgcfg.SetContext(vmCtx, func(config *pkgcfg.Config) {
+						config.Features.VMOwnedVolumes = true
+					})
+
+					vmCtx.VM.Spec.Volumes = []vmopv1.VirtualMachineVolume{
+						{
+							Name: "imported-vol",
+							VirtualMachineVolumeSource: vmopv1.VirtualMachineVolumeSource{
+								PersistentVolumeClaim: &vmopv1.PersistentVolumeClaimVolumeSource{
+									PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+										ClaimName: "imported-pvc",
+									},
+								},
+							},
+							ControllerType:      vmopv1.VirtualControllerTypeSCSI,
+							ControllerBusNumber: ptr.To(int32(0)),
+							UnitNumber:          ptr.To(int32(0)),
+						},
+					}
+
+					vmCtx.MoVM.Config = &vimtypes.VirtualMachineConfigInfo{
+						Hardware: vimtypes.VirtualHardware{
+							Device: []vimtypes.BaseVirtualDevice{
+								&vimtypes.ParaVirtualSCSIController{
+									VirtualSCSIController: vimtypes.VirtualSCSIController{
+										VirtualController: vimtypes.VirtualController{
+											BusNumber: 0,
+											VirtualDevice: vimtypes.VirtualDevice{Key: 200},
+										},
+									},
+								},
+								// Plain VMDK — no VDiskId (not an FCD).
+								&vimtypes.VirtualDisk{
+									VirtualDevice: vimtypes.VirtualDevice{
+										Backing: &vimtypes.VirtualDiskFlatVer2BackingInfo{
+											VirtualDeviceFileBackingInfo: vimtypes.VirtualDeviceFileBackingInfo{
+												FileName: "[datastore] ns/imported-vm/disk0.vmdk",
+											},
+											Uuid: "imported-disk-uuid",
+										},
+										Key:           300,
+										ControllerKey: 200,
+										UnitNumber:    ptr.To(int32(0)),
+									},
+									CapacityInBytes: 10 * oneGiBInBytes,
+								},
+							},
+						},
+					}
+					vmCtx.MoVM.LayoutEx = &vimtypes.VirtualMachineFileLayoutEx{
+						Disk: []vimtypes.VirtualMachineFileLayoutExDiskLayout{
+							{
+								Key:   300,
+								Chain: []vimtypes.VirtualMachineFileLayoutExDiskUnit{{FileKey: []int32{0, 1}}},
+							},
+						},
+						File: []vimtypes.VirtualMachineFileLayoutExFileInfo{
+							{Key: 0, Size: 1024},
+							{Key: 1, UniqueSize: 512},
+						},
+					}
+				})
+
+				Specify("status.volumes reports the disk as Managed", func() {
+					Expect(vmCtx.VM.Status.Volumes).To(HaveLen(1))
+					Expect(vmCtx.VM.Status.Volumes[0].Name).To(Equal("imported-vol"))
+					Expect(vmCtx.VM.Status.Volumes[0].Type).To(Equal(vmopv1.VolumeTypeManaged))
+					Expect(vmCtx.VM.Status.Volumes[0].Attached).To(BeTrue())
+					Expect(vmCtx.VM.Status.Volumes[0].DiskUUID).To(Equal("imported-disk-uuid"))
+				})
+
+				When("VMOwnedVolumes is disabled", func() {
+					BeforeEach(func() {
+						pkgcfg.SetContext(vmCtx, func(config *pkgcfg.Config) {
+							config.Features.VMOwnedVolumes = false
+						})
+					})
+
+					Specify("status.volumes reports the disk as Classic (unchanged behavior)", func() {
+						Expect(vmCtx.VM.Status.Volumes).To(HaveLen(1))
+						Expect(vmCtx.VM.Status.Volumes[0].Type).To(Equal(vmopv1.VolumeTypeClassic))
+					})
+				})
+			})
+
+			When("VMOwnedVolumes is enabled and a non-FCD disk already in status as Classic gains a PVC-backed spec entry", func() {
+				// Simulates the registration race: the disk was recorded as Classic
+				// on the first status pass (before unmanagedvolumes_register added
+				// the PVC-backed volume spec entry). On the next reconcile the entry
+				// is already in existingDisksInStatus (Branch A). The fix must
+				// promote the type from Classic to Managed.
+				BeforeEach(func() {
+					pkgcfg.SetContext(vmCtx, func(config *pkgcfg.Config) {
+						config.Features.VMOwnedVolumes = true
+					})
+
+					// Pre-populate status with the disk recorded as Classic
+					// (as it would be after the first reconcile).
+					vmCtx.VM.Status.Volumes = []vmopv1.VirtualMachineVolumeStatus{
+						{
+							Name:     "imported-vol",
+							Type:     vmopv1.VolumeTypeClassic,
+							DiskUUID: "imported-disk-uuid",
+							Attached: true,
+						},
+					}
+
+					// Now the volume spec entry is present (registration completed).
+					vmCtx.VM.Spec.Volumes = []vmopv1.VirtualMachineVolume{
+						{
+							Name: "imported-vol",
+							VirtualMachineVolumeSource: vmopv1.VirtualMachineVolumeSource{
+								PersistentVolumeClaim: &vmopv1.PersistentVolumeClaimVolumeSource{
+									PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+										ClaimName: "imported-pvc",
+									},
+								},
+							},
+							ControllerType:      vmopv1.VirtualControllerTypeSCSI,
+							ControllerBusNumber: ptr.To(int32(0)),
+							UnitNumber:          ptr.To(int32(0)),
+						},
+					}
+
+					vmCtx.MoVM.Config = &vimtypes.VirtualMachineConfigInfo{
+						Hardware: vimtypes.VirtualHardware{
+							Device: []vimtypes.BaseVirtualDevice{
+								&vimtypes.ParaVirtualSCSIController{
+									VirtualSCSIController: vimtypes.VirtualSCSIController{
+										VirtualController: vimtypes.VirtualController{
+											BusNumber: 0,
+											VirtualDevice: vimtypes.VirtualDevice{Key: 200},
+										},
+									},
+								},
+								// Plain VMDK — no VDiskId (not an FCD).
+								&vimtypes.VirtualDisk{
+									VirtualDevice: vimtypes.VirtualDevice{
+										Backing: &vimtypes.VirtualDiskFlatVer2BackingInfo{
+											VirtualDeviceFileBackingInfo: vimtypes.VirtualDeviceFileBackingInfo{
+												FileName: "[datastore] ns/imported-vm/disk0.vmdk",
+											},
+											Uuid: "imported-disk-uuid",
+										},
+										Key:           300,
+										ControllerKey: 200,
+										UnitNumber:    ptr.To(int32(0)),
+									},
+									CapacityInBytes: 10 * oneGiBInBytes,
+								},
+							},
+						},
+					}
+					vmCtx.MoVM.LayoutEx = &vimtypes.VirtualMachineFileLayoutEx{
+						Disk: []vimtypes.VirtualMachineFileLayoutExDiskLayout{
+							{
+								Key:   300,
+								Chain: []vimtypes.VirtualMachineFileLayoutExDiskUnit{{FileKey: []int32{0, 1}}},
+							},
+						},
+						File: []vimtypes.VirtualMachineFileLayoutExFileInfo{
+							{Key: 0, Size: 1024},
+							{Key: 1, UniqueSize: 512},
+						},
+					}
+				})
+
+				Specify("status.volumes promotes the disk from Classic to Managed", func() {
+					Expect(vmCtx.VM.Status.Volumes).To(HaveLen(1))
+					Expect(vmCtx.VM.Status.Volumes[0].Name).To(Equal("imported-vol"))
+					Expect(vmCtx.VM.Status.Volumes[0].Type).To(Equal(vmopv1.VolumeTypeManaged))
+					Expect(vmCtx.VM.Status.Volumes[0].DiskUUID).To(Equal("imported-disk-uuid"))
+					Expect(vmCtx.VM.Status.Volumes[0].Attached).To(BeTrue())
+				})
+
+				When("VMOwnedVolumes is disabled", func() {
+					BeforeEach(func() {
+						pkgcfg.SetContext(vmCtx, func(config *pkgcfg.Config) {
+							config.Features.VMOwnedVolumes = false
+						})
+					})
+
+					Specify("status.volumes type remains Classic", func() {
+						Expect(vmCtx.VM.Status.Volumes).To(HaveLen(1))
+						Expect(vmCtx.VM.Status.Volumes[0].Type).To(Equal(vmopv1.VolumeTypeClassic))
+					})
+				})
+			})
 		})
 	})
 

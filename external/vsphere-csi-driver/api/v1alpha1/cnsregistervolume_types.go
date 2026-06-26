@@ -62,6 +62,28 @@ type CnsRegisterVolumeSpec struct {
 	// BackingType enumerates types of backing for batch attach operations.
 	// These values correspond to the CnsVolumeBackingType enum.
 	BackingType string `json:"backingType,omitempty"`
+
+	// DeferFcdRegistration instructs the controller to create Kubernetes
+	// bookkeeping (PV and CsiVolumeInfo) using the PVC UID as the volume
+	// identity, without registering an FCD or creating a CNS DB entry.
+	// Used when the disk is already attached as a plain VMDK on an imported VM.
+	// +optional
+	DeferFcdRegistration bool `json:"deferFcdRegistration,omitempty"`
+
+	// VMName is the name of the VirtualMachine CR that owns this disk.
+	// Required when DeferFcdRegistration is true.
+	// +optional
+	VMName string `json:"vmName,omitempty"`
+
+	// VMInstanceUUID is the instance UUID of the owning VM.
+	// Required when DeferFcdRegistration is true.
+	// +optional
+	VMInstanceUUID string `json:"vmInstanceUUID,omitempty"`
+
+	// DiskUUID is the VirtualDisk backing UUID (VirtualDisk.Backing.Uuid).
+	// Informational only — not used as a correlation key.
+	// +optional
+	DiskUUID string `json:"diskUUID,omitempty"`
 }
 
 // CnsRegisterVolumeStatus defines the observed state of CnsRegisterVolume
@@ -76,6 +98,15 @@ type CnsRegisterVolumeStatus struct {
 	// This field must only be set by the entity completing the import
 	// operation, i.e. the CNS Operator.
 	Error string `json:"error,omitempty"`
+
+	// VolumeID is the volume identity assigned by the controller.
+	// For deferred-FCD imports this equals the PVC UID.
+	// +optional
+	VolumeID string `json:"volumeID,omitempty"`
+
+	// PvName is the name of the PersistentVolume created by the controller.
+	// +optional
+	PvName string `json:"pvName,omitempty"`
 }
 
 // +kubebuilder:object:root=true

@@ -19,6 +19,7 @@ import (
 	infrav1 "github.com/vmware-tanzu/vm-operator/external/infra/api/v1alpha1"
 
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
+	backupapi "github.com/vmware-tanzu/vm-operator/pkg/backup/api"
 	pkgcfg "github.com/vmware-tanzu/vm-operator/pkg/config"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers"
 	vsclient "github.com/vmware-tanzu/vm-operator/pkg/util/vsphere/client"
@@ -67,6 +68,10 @@ type funcs struct {
 	DeleteSnapshotFn           func(ctx context.Context, vmSnapshot *vmopv1.VirtualMachineSnapshot, vm *vmopv1.VirtualMachine, removeChildren bool, consolidate *bool) (bool, error)
 	GetSnapshotSizeFn          func(ctx context.Context, vmSnapshotName string, vm *vmopv1.VirtualMachine) (int64, error)
 	SyncVMSnapshotTreeStatusFn func(ctx context.Context, vm *vmopv1.VirtualMachine) error
+
+	GetPVCDiskDataFromSnapshotFn  func(ctx context.Context, vm *vmopv1.VirtualMachine, snapshotName string) ([]backupapi.PVCDiskData, error)
+	IsDiskRetainedByAnySnapshotFn func(ctx context.Context, vm *vmopv1.VirtualMachine, diskUUID string) (bool, error)
+	GetDiskPathFromSnapshotFn     func(ctx context.Context, vm *vmopv1.VirtualMachine, snapshotName, diskUUID string) (string, error)
 }
 
 type VMProvider struct {
@@ -482,6 +487,51 @@ func (s *VMProvider) SyncVMSnapshotTreeStatus(ctx context.Context, vm *vmopv1.Vi
 		return s.SyncVMSnapshotTreeStatusFn(ctx, vm)
 	}
 	return nil
+}
+
+// AttachOrphanedDiskToVM is a no-op stub for the fake provider.
+func (s *VMProvider) AttachOrphanedDiskToVM(_ context.Context, _ *vmopv1.VirtualMachine, _ string) error {
+	return nil
+}
+
+// DetachDiskAtSlot is a no-op stub for the fake provider.
+func (s *VMProvider) DetachDiskAtSlot(_ context.Context, _ *vmopv1.VirtualMachine, _ vmopv1.VirtualControllerType, _, _ int32) (string, error) {
+	return "", nil
+}
+
+// GetPVCDiskDataFromSnapshot delegates to GetPVCDiskDataFromSnapshotFn if set.
+func (s *VMProvider) GetPVCDiskDataFromSnapshot(ctx context.Context, vm *vmopv1.VirtualMachine, snapshotName string) ([]backupapi.PVCDiskData, error) {
+	s.Lock()
+	defer s.Unlock()
+	if s.GetPVCDiskDataFromSnapshotFn != nil {
+		return s.GetPVCDiskDataFromSnapshotFn(ctx, vm, snapshotName)
+	}
+	return nil, nil
+}
+
+// GetDiskPathAtSlot is a no-op stub for the fake provider.
+func (s *VMProvider) GetDiskPathAtSlot(_ context.Context, _ *vmopv1.VirtualMachine, _ vmopv1.VirtualControllerType, _, _ int32) (string, error) {
+	return "", nil
+}
+
+// IsDiskRetainedByAnySnapshot delegates to IsDiskRetainedByAnySnapshotFn if set.
+func (s *VMProvider) IsDiskRetainedByAnySnapshot(ctx context.Context, vm *vmopv1.VirtualMachine, diskUUID string) (bool, error) {
+	s.Lock()
+	defer s.Unlock()
+	if s.IsDiskRetainedByAnySnapshotFn != nil {
+		return s.IsDiskRetainedByAnySnapshotFn(ctx, vm, diskUUID)
+	}
+	return false, nil
+}
+
+// GetDiskPathFromSnapshot delegates to GetDiskPathFromSnapshotFn if set.
+func (s *VMProvider) GetDiskPathFromSnapshot(ctx context.Context, vm *vmopv1.VirtualMachine, snapshotName, diskUUID string) (string, error) {
+	s.Lock()
+	defer s.Unlock()
+	if s.GetDiskPathFromSnapshotFn != nil {
+		return s.GetDiskPathFromSnapshotFn(ctx, vm, snapshotName, diskUUID)
+	}
+	return "", nil
 }
 
 func NewVMProvider() *VMProvider {
