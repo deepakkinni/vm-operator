@@ -81,8 +81,10 @@ func (r *Reconciler) evaluateCVIForDeletedSnapshot(
 		}
 	}
 
-	// Check if any remaining snapshot (managed or unmanaged) still retains this disk.
-	retained, err := r.isDiskRetainedByRemainingSnapshot(ctx, vm, vmSnapshot.Name, disk.PVCName, disk.UUID)
+	// Check if any remaining snapshot (managed or unmanaged) still retains this
+	// disk. The deleting snapshot is excluded from the managed fast path.
+	retained, err := vmopv1util.IsDiskRetainedBySnapshot(
+		ctx, r.Client, r.VMProvider, ctx.Logger, vm, vmSnapshot.Name, disk.PVCName, disk.UUID)
 	if err != nil {
 		return fmt.Errorf("failed to check snapshot retention for PVC %q: %w", disk.PVCName, err)
 	}
@@ -110,70 +112,4 @@ func (r *Reconciler) evaluateCVIForDeletedSnapshot(
 
 	logger.Info("Successfully removed VM entry from CVI", "vmName", vmSnapshot.Spec.VMName)
 	return nil
-}
-
-// isDiskRetainedByRemainingSnapshot returns true if any snapshot — managed or
-// unmanaged — retains the given disk. It runs in two tiers:
-//
-//  1. Fast path: scans remaining VirtualMachineSnapshot CRs for the PVC name
-//     in their PVCDiskData ExtraConfig. This covers managed snapshots quickly.
-//
-//  2. Authoritative backstop: queries the live vCenter snapshot tree and
-//     checks every node (including unmanaged snapshots with no CR) for a
-//     VirtualDisk whose backing UUID matches the disk recorded in pvcDisk.
-//     This tier is required — unmanaged snapshots are invisible to the fast
-//     path yet can still pin the VMDK.
-func (r *Reconciler) isDiskRetainedByRemainingSnapshot(
-	ctx *pkgctx.VirtualMachineSnapshotContext,
-	vm *vmopv1.VirtualMachine,
-	deletingSnapshotName, pvcName, diskUUID string) (bool, error) {
-
-	// --- Fast path: managed VMSnapshot CRs ---
-	var snapshotList vmopv1.VirtualMachineSnapshotList
-	if err := r.Client.List(ctx, &snapshotList,
-		ctrlclient.InNamespace(ctx.VirtualMachineSnapshot.Namespace)); err != nil {
-		return false, fmt.Errorf("failed to list VirtualMachineSnapshots: %w", err)
-	}
-
-	for i := range snapshotList.Items {
-		snap := &snapshotList.Items[i]
-
-		if snap.Name == deletingSnapshotName {
-			continue
-		}
-		if snap.Spec.VMName != vm.Name {
-			continue
-		}
-
-		snapDisks, err := r.VMProvider.GetPVCDiskDataFromSnapshot(ctx, vm, snap.Name)
-		if err != nil {
-			ctx.Logger.V(4).Info("Failed to read PVC disk data from snapshot, skipping",
-				"snapshotName", snap.Name, "error", err.Error())
-			continue
-		}
-
-		for _, d := range snapDisks {
-			if d.PVCName == pvcName {
-				return true, nil
-			}
-		}
-	}
-
-	// --- Authoritative backstop: live vCenter snapshot tree ---
-	// This covers unmanaged snapshots (no CR) that are invisible above.
-	if diskUUID == "" {
-		// No UUID available — cannot perform the vCenter check. Treat as
-		// not retained to avoid permanently blocking re-registration, but
-		// log so the operator can investigate.
-		ctx.Logger.Info("Disk UUID is empty; skipping vCenter snapshot tree check",
-			"pvcName", pvcName)
-		return false, nil
-	}
-
-	retained, err := r.VMProvider.IsDiskRetainedByAnySnapshot(ctx, vm, diskUUID)
-	if err != nil {
-		return false, fmt.Errorf("failed to check vCenter snapshot tree for disk %s: %w", diskUUID, err)
-	}
-
-	return retained, nil
 }

@@ -5,6 +5,7 @@
 package volumeattachdetach_test
 
 import (
+	"context"
 	"errors"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -23,6 +24,7 @@ import (
 	"github.com/vmware-tanzu/vm-operator/pkg/constants/testlabels"
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
 	pkgerr "github.com/vmware-tanzu/vm-operator/pkg/errors"
+	providerfake "github.com/vmware-tanzu/vm-operator/pkg/providers/fake"
 	"github.com/vmware-tanzu/vm-operator/pkg/util/ptr"
 	vmopv1util "github.com/vmware-tanzu/vm-operator/pkg/util/vmopv1"
 	"github.com/vmware-tanzu/vm-operator/test/builder"
@@ -242,6 +244,77 @@ var _ = Describe(
 						err := reconciler.ReconcileNormal(volCtx)
 						Expect(err).ToNot(HaveOccurred())
 						Expect(vm.Status.Volumes).To(BeEmpty())
+					})
+
+					// Detach path: a CVI references this VM but its PVC is no
+					// longer in spec.volumes (e.g. dropped by a snapshot revert).
+					// The VM entry must be removed ONLY when no snapshot retains
+					// the disk (spec §5.4, §11.2 E.5).
+					When("a CVI references the VM but its PVC is no longer in spec.volumes", func() {
+						const (
+							detachPVC   = "detached-pvc"
+							detachVolID = "vol-detach"
+						)
+
+						getCVI := func() *cnsv1alpha1.CsiVolumeInfo {
+							cvi := &cnsv1alpha1.CsiVolumeInfo{}
+							Expect(ctx.Client.Get(ctx, client.ObjectKey{
+								Name:      vmopv1util.CVINameForVolumeID(detachVolID),
+								Namespace: pkgconst.CVISystemNamespace,
+							}, cvi)).To(Succeed())
+							return cvi
+						}
+
+						BeforeEach(func() {
+							vm.Spec.Volumes = nil
+							cvi := &cnsv1alpha1.CsiVolumeInfo{
+								ObjectMeta: metav1.ObjectMeta{
+									Name:      vmopv1util.CVINameForVolumeID(detachVolID),
+									Namespace: pkgconst.CVISystemNamespace,
+								},
+								Spec: cnsv1alpha1.CsiVolumeInfoSpec{
+									VolumeID:     detachVolID,
+									PVCName:      detachPVC,
+									PVCNamespace: ns,
+									DiskUUID:     "disk-uuid-detach",
+									VMs: []cnsv1alpha1.CsiVolumeInfoVMEntry{
+										{VMName: vmName},
+									},
+								},
+								Status: cnsv1alpha1.CsiVolumeInfoStatus{
+									Ownership: cnsv1alpha1.OwnershipVMManaged,
+									Phase:     cnsv1alpha1.PhaseSucceeded,
+								},
+							}
+							initObjects = append(initObjects, cvi)
+						})
+
+						When("a VM snapshot still retains the disk", func() {
+							JustBeforeEach(func() {
+								ctx.VMProvider.(*providerfake.VMProvider).IsDiskRetainedByAnySnapshotFn =
+									func(_ context.Context, _ *vmopv1.VirtualMachine, _ string) (bool, error) {
+										return true, nil
+									}
+							})
+
+							It("keeps the VM entry in the CVI (no premature re-register)", func() {
+								err := reconciler.ReconcileNormal(volCtx)
+								Expect(err).ToNot(HaveOccurred())
+								Expect(vmopv1util.HasVMEntry(getCVI(), vmName)).To(BeTrue(),
+									"VM entry must persist while a snapshot retains the disk")
+							})
+						})
+
+						When("no snapshot retains the disk", func() {
+							// Fake provider's IsDiskRetainedByAnySnapshot defaults
+							// to false; no managed snapshots exist either.
+							It("removes the VM entry from the CVI", func() {
+								err := reconciler.ReconcileNormal(volCtx)
+								Expect(err).ToNot(HaveOccurred())
+								Expect(vmopv1util.HasVMEntry(getCVI(), vmName)).To(BeFalse(),
+									"VM entry must be removed when nothing retains the disk")
+							})
+						})
 					})
 
 					When("VM has a volume with IndependentPersistent diskMode", func() {

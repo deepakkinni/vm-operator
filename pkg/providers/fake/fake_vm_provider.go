@@ -68,6 +68,9 @@ type funcs struct {
 	DeleteSnapshotFn           func(ctx context.Context, vmSnapshot *vmopv1.VirtualMachineSnapshot, vm *vmopv1.VirtualMachine, removeChildren bool, consolidate *bool) (bool, error)
 	GetSnapshotSizeFn          func(ctx context.Context, vmSnapshotName string, vm *vmopv1.VirtualMachine) (int64, error)
 	SyncVMSnapshotTreeStatusFn func(ctx context.Context, vm *vmopv1.VirtualMachine) error
+
+	GetPVCDiskDataFromSnapshotFn  func(ctx context.Context, vm *vmopv1.VirtualMachine, snapshotName string) ([]backupapi.PVCDiskData, error)
+	IsDiskRetainedByAnySnapshotFn func(ctx context.Context, vm *vmopv1.VirtualMachine, diskUUID string) (bool, error)
 }
 
 type VMProvider struct {
@@ -495,8 +498,13 @@ func (s *VMProvider) DetachDiskAtSlot(_ context.Context, _ *vmopv1.VirtualMachin
 	return "", nil
 }
 
-// GetPVCDiskDataFromSnapshot is a no-op stub for the fake provider.
-func (s *VMProvider) GetPVCDiskDataFromSnapshot(_ context.Context, _ *vmopv1.VirtualMachine, _ string) ([]backupapi.PVCDiskData, error) {
+// GetPVCDiskDataFromSnapshot delegates to GetPVCDiskDataFromSnapshotFn if set.
+func (s *VMProvider) GetPVCDiskDataFromSnapshot(ctx context.Context, vm *vmopv1.VirtualMachine, snapshotName string) ([]backupapi.PVCDiskData, error) {
+	s.Lock()
+	defer s.Unlock()
+	if s.GetPVCDiskDataFromSnapshotFn != nil {
+		return s.GetPVCDiskDataFromSnapshotFn(ctx, vm, snapshotName)
+	}
 	return nil, nil
 }
 
@@ -505,8 +513,13 @@ func (s *VMProvider) GetDiskPathAtSlot(_ context.Context, _ *vmopv1.VirtualMachi
 	return "", nil
 }
 
-// IsDiskRetainedByAnySnapshot is a no-op stub for the fake provider.
-func (s *VMProvider) IsDiskRetainedByAnySnapshot(_ context.Context, _ *vmopv1.VirtualMachine, _ string) (bool, error) {
+// IsDiskRetainedByAnySnapshot delegates to IsDiskRetainedByAnySnapshotFn if set.
+func (s *VMProvider) IsDiskRetainedByAnySnapshot(ctx context.Context, vm *vmopv1.VirtualMachine, diskUUID string) (bool, error) {
+	s.Lock()
+	defer s.Unlock()
+	if s.IsDiskRetainedByAnySnapshotFn != nil {
+		return s.IsDiskRetainedByAnySnapshotFn(ctx, vm, diskUUID)
+	}
 	return false, nil
 }
 
