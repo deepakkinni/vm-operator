@@ -2,7 +2,7 @@
 // The term "Broadcom" refers to Broadcom Inc. and/or its subsidiaries.
 // SPDX-License-Identifier: Apache-2.0
 
-package volumebatch
+package volumeattachdetach
 
 import (
 	"context"
@@ -45,7 +45,7 @@ import (
 )
 
 const (
-	controllerName = "volumebatch"
+	controllerName = "volumeattachdetach"
 	// In BatchAttachment status, CSI hardcode a volume name entry with :detaching
 	// suffix if it's being detached. CSI only adds that after they have finished
 	// a CNS detach call, which could take up to minutes. So we still want to add
@@ -103,7 +103,7 @@ func AddToManager(ctx *pkgctx.ControllerManagerContext, mgr manager.Manager) err
 	r := NewReconciler(
 		ctx,
 		mgr.GetClient(),
-		ctrl.Log.WithName("controllers").WithName("volumebatch"),
+		ctrl.Log.WithName("controllers").WithName("volumeattachdetach"),
 		record.New(mgr.GetEventRecorder(controllerNameShort)),
 		ctx.VMProvider,
 	)
@@ -231,6 +231,7 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=cns.vmware.com,resources=cnsnodevmbatchattachments,verbs=create;delete;get;list;watch;patch;update
 // +kubebuilder:rbac:groups=cns.vmware.com,resources=cnsnodevmbatchattachments/status,verbs=get;list
 // +kubebuilder:rbac:groups=cns.vmware.com,resources=cnsnodevmattachments,verbs=delete;get;list;watch
+// +kubebuilder:rbac:groups=cns.vmware.com,resources=csivolumeinfos,verbs=get;list;watch;patch;update
 
 // Reconcile reconciles a VirtualMachine object and processes the volumes for batch attachment.
 func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (_ ctrl.Result, reterr error) {
@@ -340,6 +341,16 @@ func (r *Reconciler) ReconcileNormal(ctx *pkgctx.VolumeContext) error {
 		return nil
 	}
 
+	// For VM-owned-volumes VMs, first reconcile the dependent-persistent
+	// volumes via the CsiVolumeInfo-based path. The batch path below handles
+	// the remaining (independent/non-owned) volumes for the same VM.
+	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes &&
+		vmopv1util.HasVMOwnedVolumesAnnotation(ctx.VM) {
+		if err := r.reconcileOwnedVolumes(ctx); err != nil {
+			return err
+		}
+	}
+
 	legacyAttachments, err := pkgutil.GetCnsNodeVMAttachmentsForVM(ctx, r.Client, ctx.VM)
 	if err != nil {
 		return fmt.Errorf(
@@ -388,16 +399,28 @@ func (r *Reconciler) ReconcileNormal(ctx *pkgctx.VolumeContext) error {
 	}
 
 	// Process volumes and create/update batch attachment.
-	// filter Volume spec that doesn't cause error and return them
-	// for constructing the VM's volumeStatus.
-	filteredVolumeSpecsForBatch, processErr := r.processBatchAttachmentAndFilterVolumeSpecs(
-		ctx,
-		volumeSpecsForBatch,
-		batchAttachment,
+	// Skip batch processing only for VM-owned-volumes VMs that have no
+	// independent volumes to manage and no existing attachment to clean up.
+	// For all other VMs (including those with legacy attachments only) an
+	// empty CnsNodeVMBatchAttachment is created intentionally to signal CSI.
+	var (
+		filteredVolumeSpecsForBatch []cnsv1alpha1.VolumeSpec
+		processErr                  error
 	)
-	if processErr != nil {
-		ctx.Logger.Error(processErr, "Error processing CnsNodeVMBatchAttachments")
-		// Keep going to return aggregated error below.
+	skipBatch := pkgcfg.FromContext(ctx).Features.VMOwnedVolumes &&
+		vmopv1util.HasVMOwnedVolumesAnnotation(ctx.VM) &&
+		len(volumeSpecsForBatch) == 0 &&
+		batchAttachment == nil
+	if !skipBatch {
+		filteredVolumeSpecsForBatch, processErr = r.processBatchAttachmentAndFilterVolumeSpecs(
+			ctx,
+			volumeSpecsForBatch,
+			batchAttachment,
+		)
+		if processErr != nil {
+			ctx.Logger.Error(processErr, "Error processing CnsNodeVMBatchAttachments")
+			// Keep going to return aggregated error below.
+		}
 	}
 
 	// Record the volumes currently in status so we can log what's removed.
@@ -424,10 +447,25 @@ func (r *Reconciler) ReconcileNormal(ctx *pkgctx.VolumeContext) error {
 		volumeSpecsForLegacy,
 	)
 
+	// Collect the spec-volume names whose status entries are owned by the
+	// CsiVolumeInfo path so updateVMVolumeStatus can preserve them.
+	// These are the dependent-persistent volumes on VM-owned-volumes VMs —
+	// the same set excluded from the batch path by categorizeVolumeSpecs.
+	ownedVolumeNames := make(map[string]struct{})
+	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes &&
+		vmopv1util.HasVMOwnedVolumesAnnotation(ctx.VM) {
+		for _, vol := range ctx.VM.Spec.Volumes {
+			if vol.PersistentVolumeClaim != nil && vmopv1util.IsDependentPersistentMode(vol) {
+				ownedVolumeNames[vol.Name] = struct{}{}
+			}
+		}
+	}
+
 	updateVMVolumeStatus(
 		ctx,
 		volumeStatusesForBatch,
 		volumeStatusesForLegacy,
+		ownedVolumeNames,
 	)
 
 	if len(beforeStatusVolumes) > 0 {
@@ -921,13 +959,18 @@ func (r *Reconciler) updateVolumeStatusWithPVCInfo(
 	return nil
 }
 
-func (r *Reconciler) ReconcileDelete(_ *pkgctx.VolumeContext) error {
-	// Do nothing here since we depend on the Garbage Collector to do the
-	// deletion of the dependent CNSNodeVMBatchAttachment objects when their
-	// owning VM is deleted.
-	// We require the Volume provider to handle the situation where the VM is
-	// deleted before the volumes are detached & removed.
+func (r *Reconciler) ReconcileDelete(ctx *pkgctx.VolumeContext) error {
+	// For VM-owned-volumes VMs, clean up CsiVolumeInfo entries that reference
+	// this VM before allowing the VM CR to be garbage-collected.
+	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes &&
+		vmopv1util.HasVMOwnedVolumesAnnotation(ctx.VM) {
+		return r.reconcileOwnedVolumeDelete(ctx)
+	}
 
+	// For all other VMs, depend on the Garbage Collector to delete the
+	// dependent CnsNodeVMBatchAttachment objects via owner reference.
+	// The Volume provider handles the case where the VM is deleted before
+	// volumes are detached and removed.
 	return nil
 }
 
@@ -1277,14 +1320,24 @@ func (r *Reconciler) getVMVolStatusesFromLegacyAttachments(
 
 // updateVMVolumeStatus clears any managed volume status then adds given
 // volume status info to vm.status.volumes, then sorts the status.
+// ownedVolumes is the set of volume names whose status entries are owned by
+// the CsiVolumeInfo/VMManaged path; those entries are preserved and not
+// replaced by the batch or legacy streams.
 func updateVMVolumeStatus(
 	ctx *pkgctx.VolumeContext,
 	v1, v2 []vmopv1.VirtualMachineVolumeStatus,
+	ownedVolumeNames map[string]struct{},
 ) {
-	// Remove any managed volumes from the existing status.
+	// Remove managed volumes that are NOT owned by the CVI path. CVI-owned
+	// entries were written by reconcileOwnedVolumes in this same reconcile
+	// and must not be erased by the batch rebuild.
 	ctx.VM.Status.Volumes = slices.DeleteFunc(ctx.VM.Status.Volumes,
 		func(e vmopv1.VirtualMachineVolumeStatus) bool {
-			return e.Type != vmopv1.VolumeTypeClassic
+			if e.Type == vmopv1.VolumeTypeClassic {
+				return false // always keep Classic entries
+			}
+			_, isCVIOwned := ownedVolumeNames[e.Name]
+			return !isCVIOwned // remove non-CVI managed entries
 		})
 
 	ctx.VM.Status.Volumes = append(ctx.VM.Status.Volumes, v1...)
@@ -1308,10 +1361,23 @@ func categorizeVolumeSpecs(
 	// by legacy CnsNodeVmAttachment
 	volumeSpecsForBatch := []vmopv1.VirtualMachineVolume{}
 	volumeSpecsForLegacy := []vmopv1.VirtualMachineVolume{}
+	// isOwnedVM is true when the CVI/VMManaged path is active for this VM.
+	// Dependent-persistent volumes on such VMs are reconciled by
+	// reconcileOwnedVolumes, not by the batch attachment path.
+	isOwnedVM := pkgcfg.FromContext(ctx).Features.VMOwnedVolumes &&
+		vmopv1util.HasVMOwnedVolumesAnnotation(ctx.VM)
+
 	for _, vol := range ctx.VM.Spec.Volumes {
 		if vol.PersistentVolumeClaim == nil {
 			continue
 		}
+
+		// Dependent-persistent volumes on VM-owned-volumes VMs are handled
+		// exclusively by the CsiVolumeInfo path — exclude them from batch.
+		if isOwnedVM && vmopv1util.IsDependentPersistentMode(vol) {
+			continue
+		}
+
 		// Check if this volume is already managed by a legacy
 		// CnsNodeVmAttachment.
 		// When we create legacyAttachment, we use volume name as its name.
@@ -1335,8 +1401,8 @@ func categorizeVolumeSpecs(
 			}
 		}
 
-		// Only include greenfield volumes that are not tracked by
-		// legacy CnsNodeVmAttachment or those whose PVCs have been changed.
+		// Include volumes not tracked by a legacy attachment or those whose
+		// PVCs have been changed.
 		volumeSpecsForBatch = append(volumeSpecsForBatch, vol)
 	}
 

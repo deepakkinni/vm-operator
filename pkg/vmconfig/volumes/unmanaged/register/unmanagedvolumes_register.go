@@ -150,6 +150,27 @@ func (r reconciler) Reconcile(
 	info.Disks = pkgvol.FilterOutLinkedClones(info.Disks...)
 	info.Disks = pkgvol.FilterOutEmptyUUIDOrFilename(info.Disks...)
 
+	// When VMOwnedVolumes is enabled, a dependent PVC disk is attached to the
+	// VM as a plain VMDK (the FCD is unregistered during ownership transfer),
+	// so it survives the FCD filter above and looks like an unmanaged classic
+	// disk. Such disks are already backed by a real, non-placeholder PVC and
+	// must not be re-registered. Exclude them so this plugin never treats a
+	// VM-owned managed volume as unmanaged. Disks with no PVC, or with this
+	// VM's own registration placeholder PVC (dataSourceRef -> this VM), are
+	// retained as registration candidates.
+	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes {
+		var err error
+		info.Disks, err = filterOutManagedPVCDisks(ctx, k8sClient, vm, info)
+		if err != nil {
+			pkgcond.MarkError(
+				vm,
+				Condition,
+				"ErrConfigUpdate",
+				err)
+			return err
+		}
+	}
+
 	hasConfigSpecChanges, err := ensureUnmanagedDisksConfigsAreUpdated(
 		ctx,
 		k8sClient,
@@ -516,6 +537,87 @@ func ensureUnmanagedDisksHaveUpdatedCapacity(
 	return nil
 }
 
+// filterOutManagedPVCDisks returns the subset of info.Disks that are genuine
+// unmanaged-registration candidates, dropping any disk already backed by a
+// real (non-placeholder) PVC.
+//
+// A disk is retained when its target maps to a spec volume that either:
+//   - has no PersistentVolumeClaim (a classic disk awaiting a placeholder), or
+//   - references a PVC that does not exist yet (NotFound), or
+//   - references this VM's own registration placeholder PVC, identified by a
+//     dataSourceRef pointing at this VirtualMachine.
+//
+// A disk is dropped when its PVC exists and is not this VM's placeholder (for
+// example a user- or CSI-provisioned PVC, or one cloned from an image or
+// snapshot). Such a PVC is a real managed volume — frequently a VM-owned
+// dependent disk attached as a plain VMDK after its FCD was unregistered — and
+// must not be treated as unmanaged. The classification is provenance-based
+// (who owns the PVC) rather than state-based (whether it is bound), so it stays
+// correct while a managed PVC is still binding or being recreated on restore.
+func filterOutManagedPVCDisks(
+	ctx context.Context,
+	k8sClient ctrlclient.Client,
+	vm *vmopv1.VirtualMachine,
+	info pkgvol.VolumeInfo) ([]pkgvol.VirtualDiskInfo, error) {
+
+	logger := pkglog.FromContextOrDefault(ctx).
+		WithName("filterOutManagedPVCDisks")
+
+	out := make([]pkgvol.VirtualDiskInfo, 0, len(info.Disks))
+
+	for _, di := range info.Disks {
+		vol := info.Volumes[di.Target.String()]
+		if vol == nil || vol.PersistentVolumeClaim == nil {
+			// No PVC-backed spec volume — a classic disk candidate.
+			out = append(out, di)
+			continue
+		}
+
+		pvc := &corev1.PersistentVolumeClaim{}
+		key := ctrlclient.ObjectKey{
+			Namespace: vm.Namespace,
+			Name:      vol.PersistentVolumeClaim.ClaimName,
+		}
+		if err := k8sClient.Get(ctx, key, pvc); err != nil {
+			if apierrors.IsNotFound(err) {
+				// The PVC does not exist yet — retain so it can be created.
+				out = append(out, di)
+				continue
+			}
+			return nil, fmt.Errorf(
+				"failed to get pvc %s while classifying unmanaged disks: %w",
+				key, err)
+		}
+
+		if isRegistrationPlaceholderPVC(pvc, vm.Name) {
+			// This VM's own placeholder, still being registered — retain.
+			out = append(out, di)
+			continue
+		}
+
+		logger.V(4).Info(
+			"Excluding managed PVC disk from unmanaged volume registration",
+			"disk", di.UUID, "pvc", key.Name)
+	}
+
+	return out, nil
+}
+
+// isRegistrationPlaceholderPVC reports whether the PVC is a placeholder created
+// by this plugin to register an unmanaged disk for the given VM, identified by
+// a dataSourceRef that points at the VirtualMachine. This mirrors the
+// dataSourceRef that ensurePVCForUnmanagedDisk writes.
+func isRegistrationPlaceholderPVC(
+	pvc *corev1.PersistentVolumeClaim, vmName string) bool {
+
+	dsRef := pvc.Spec.DataSourceRef
+	return dsRef != nil &&
+		dsRef.APIGroup != nil &&
+		*dsRef.APIGroup == vmopv1.GroupVersion.Group &&
+		dsRef.Kind == "VirtualMachine" &&
+		dsRef.Name == vmName
+}
+
 // registerUnmanagedDisks uses a two-phase flow:
 //  1. Ensure every unmanaged classic disk has a PVC and claimName on the VM
 //     spec, then return pending so the volume batch controller can add unbound
@@ -574,10 +676,19 @@ func registerUnmanagedDisks(
 		return true, nil
 	}
 
-	batchShowsPVCVolumeIDCacheMiss, err := batchAttachReportsMissingPVCVolumeIDInCache(
-		ctx, k8sClient, vm)
-	if err != nil {
-		return false, err
+	// VM-owned VMs are routed to reconcileOwnedVolumes, not through
+	// CnsNodeVMBatchAttachment, so the batch cache-miss signal will never
+	// arrive. Create the CRV as soon as the PVC exists and is pending.
+	vmOwnedVolumes := pkgcfg.FromContext(ctx).Features.VMOwnedVolumes
+
+	var batchShowsPVCVolumeIDCacheMiss bool
+	if !vmOwnedVolumes {
+		var err error
+		batchShowsPVCVolumeIDCacheMiss, err = batchAttachReportsMissingPVCVolumeIDInCache(
+			ctx, k8sClient, vm)
+		if err != nil {
+			return false, err
+		}
 	}
 
 	var hasPending bool
@@ -606,14 +717,15 @@ func registerUnmanagedDisks(
 			continue
 		}
 
-		if !batchShowsPVCVolumeIDCacheMiss {
+		if !vmOwnedVolumes && !batchShowsPVCVolumeIDCacheMiss {
 			hasPending = true
 			continue
 		}
 
-		logger.V(4).Info("Phase 2: PVC pending, batch status shows volume ID cache miss; ensuring CnsRegisterVolume",
+		logger.V(4).Info("Phase 2: PVC pending; ensuring CnsRegisterVolume",
 			"pvc", pvcObj.Name,
-			"isFCD", di.FCD)
+			"isFCD", di.FCD,
+			"deferFcdRegistration", vmOwnedVolumes)
 
 		if _, err := ensureCnsRegisterVolumeForDisk(
 			ctx,
@@ -905,6 +1017,17 @@ func ensureCnsRegisterVolumeForDisk(
 
 		// Set the disk backing type.
 		obj.Spec.BackingType = string(diskInfo.BackingType)
+
+		// When VMOwnedVolumes is on, instruct CSI to skip FCD registration and
+		// create the PV and CsiVolumeInfo using the PVC UID as the volume
+		// identity. The disk is already attached as a plain VMDK; creating an
+		// FCD would introduce a mixed snapshot-chain problem.
+		if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes {
+			obj.Spec.DeferFcdRegistration = true
+			obj.Spec.VMName = vm.Name
+			obj.Spec.VMInstanceUUID = vm.Status.InstanceUUID
+			obj.Spec.DiskUUID = diskInfo.UUID
+		}
 
 		// Create the CRV.
 		if err := k8sClient.Create(ctx, obj); err != nil {

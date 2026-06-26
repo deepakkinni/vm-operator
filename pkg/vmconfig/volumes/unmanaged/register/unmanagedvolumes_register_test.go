@@ -363,6 +363,119 @@ var _ = Describe("Reconcile", func() {
 			})
 		})
 
+		Context("VM-owned dependent disk backed by a non-placeholder PVC", func() {
+
+			// A dependent VM-owned volume is attached as a plain VMDK (its FCD
+			// is unregistered during ownership transfer), so it survives the
+			// FCD filter and would otherwise be misdetected as an unmanaged
+			// classic disk. Its PVC is user/CSI-provisioned (no dataSourceRef
+			// pointing at the VM), so the register plugin must leave it alone
+			// when VMOwnedVolumes is enabled.
+			const pvcName = "user-pvc"
+
+			BeforeEach(func() {
+				withObjs = append(withObjs,
+					&corev1.PersistentVolumeClaim{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: vm.Namespace,
+							Name:      pvcName,
+						},
+						Spec: corev1.PersistentVolumeClaimSpec{
+							StorageClassName: ptr.To("my-storage-class-1"),
+							VolumeName:       "pv-user",
+						},
+						Status: corev1.PersistentVolumeClaimStatus{
+							Phase: corev1.ClaimBound,
+						},
+					})
+
+				vm.Spec.Volumes = []vmopv1.VirtualMachineVolume{
+					{
+						Name: "my-disk",
+						VirtualMachineVolumeSource: vmopv1.VirtualMachineVolumeSource{
+							PersistentVolumeClaim: &vmopv1.PersistentVolumeClaimVolumeSource{
+								PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: pvcName,
+								},
+							},
+						},
+						ControllerType:      vmopv1.VirtualControllerTypeSCSI,
+						ControllerBusNumber: ptr.To(int32(1)),
+						UnitNumber:          ptr.To(int32(0)),
+					},
+				}
+
+				disk := &vimtypes.VirtualDisk{
+					VirtualDevice: vimtypes.VirtualDevice{
+						Key:           300,
+						ControllerKey: 200,
+						UnitNumber:    ptr.To(int32(0)),
+						Backing: &vimtypes.VirtualDiskFlatVer2BackingInfo{
+							VirtualDeviceFileBackingInfo: vimtypes.VirtualDeviceFileBackingInfo{
+								FileName: "[LocalDS_0] vm1/my-disk.vmdk",
+							},
+							Uuid: "user-disk-uuid",
+						},
+					},
+					CapacityInBytes: 1 * 1024 * 1024 * 1024,
+				}
+				scsiController := &vimtypes.VirtualSCSIController{
+					VirtualController: vimtypes.VirtualController{
+						VirtualDevice: vimtypes.VirtualDevice{
+							Key: 200,
+						},
+						BusNumber: 1,
+					},
+				}
+				moVM.Config = &vimtypes.VirtualMachineConfigInfo{
+					Hardware: vimtypes.VirtualHardware{
+						Device: []vimtypes.BaseVirtualDevice{
+							scsiController,
+							disk,
+						},
+					},
+				}
+			})
+
+			JustBeforeEach(func() {
+				pkgcfg.SetContext(ctx, func(config *pkgcfg.Config) {
+					config.Features.VMOwnedVolumes = true
+					config.Features.VMSharedDisks = true
+				})
+			})
+
+			It("should not register or mutate the managed PVC", func() {
+				Expect(unmanagedvolsreg.Reconcile(
+					ctx,
+					k8sClient,
+					vimClient,
+					vm,
+					moVM,
+					configSpec)).To(Succeed())
+
+				// The bound, user-provisioned PVC must be left untouched: no
+				// dataSourceRef and no VM ownerReference were added.
+				var pvc corev1.PersistentVolumeClaim
+				Expect(k8sClient.Get(ctx, ctrlclient.ObjectKey{
+					Namespace: vm.Namespace,
+					Name:      pvcName,
+				}, &pvc)).To(Succeed())
+				Expect(pvc.Spec.DataSourceRef).To(BeNil())
+				Expect(pvc.OwnerReferences).To(BeEmpty())
+
+				// No CnsRegisterVolume should be created for a managed disk.
+				var crvList cnsv1alpha1.CnsRegisterVolumeList
+				Expect(k8sClient.List(ctx, &crvList,
+					ctrlclient.InNamespace(vm.Namespace))).To(Succeed())
+				Expect(crvList.Items).To(BeEmpty())
+
+				// The condition reflects that registration is complete.
+				cond := pkgcond.Get(vm, unmanagedvolsreg.Condition)
+				Expect(cond).ToNot(BeNil())
+				Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			})
+		})
+
 		Context("PVC creation and management", func() {
 
 			When("VM has unmanaged disks with no sharing", func() {
@@ -3183,7 +3296,7 @@ var _ = Describe("Reconcile", func() {
 				BeforeEach(func() {
 					// Set up VM with FCD disk that has a volume entry
 					// FCD disks are filtered out early because:
-					// - Greenfield VMs can't have classic/unmanaged disks as FCDs
+					// - VMOwnedVolumes VMs can't have classic/unmanaged disks as FCDs
 					// - Imported VMs can't have any disks as FCDs
 					// - Registered VMs (VADP) have FCDs already registered as PVCs by RegisterVM
 					vm.Spec.Volumes = []vmopv1.VirtualMachineVolume{
@@ -3284,6 +3397,197 @@ var _ = Describe("Reconcile", func() {
 						Name:      "fcd-pvc",
 					}, crv)
 					Expect(apierrors.IsNotFound(err)).To(BeTrue())
+				})
+			})
+
+			Context("VM-owned volumes (deferFcdRegistration) path", func() {
+				// diskUUID and diskPath values reused across sub-cases.
+				const (
+					importDiskUUID     = "import-disk-uuid-1"
+					importDiskFileName = "[LocalDS_0] vm1/import-disk.vmdk"
+					importPVCName      = "import-pvc"
+					importInstanceUUID = "vm-instance-uuid-abc"
+				)
+
+				BeforeEach(func() {
+					pkgcfg.SetContext(ctx, func(config *pkgcfg.Config) {
+						config.Features.VMOwnedVolumes = true
+					})
+
+					vm.Status.InstanceUUID = importInstanceUUID
+
+					vm.Spec.Volumes = []vmopv1.VirtualMachineVolume{
+						{
+							Name: "import-volume",
+							VirtualMachineVolumeSource: vmopv1.VirtualMachineVolumeSource{
+								PersistentVolumeClaim: &vmopv1.PersistentVolumeClaimVolumeSource{
+									PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+										ClaimName: importPVCName,
+									},
+								},
+							},
+							ControllerType:      vmopv1.VirtualControllerTypeIDE,
+							ControllerBusNumber: ptr.To(int32(0)),
+							UnitNumber:          ptr.To(int32(0)),
+						},
+					}
+
+					pendingPVC := &corev1.PersistentVolumeClaim{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      importPVCName,
+							Namespace: vm.Namespace,
+							OwnerReferences: []metav1.OwnerReference{
+								{
+									APIVersion: vmopv1.GroupVersion.String(),
+									Kind:       "VirtualMachine",
+									Name:       vm.Name,
+									UID:        vm.UID,
+								},
+							},
+						},
+						Spec: corev1.PersistentVolumeClaimSpec{
+							DataSourceRef: &corev1.TypedObjectReference{
+								APIGroup: &vmopv1.GroupVersion.Group,
+								Kind:     "VirtualMachine",
+								Name:     vm.Name,
+							},
+							AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+							Resources: corev1.VolumeResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceStorage: *kubeutil.BytesToResource(1024 * 1024 * 1024),
+								},
+							},
+						},
+						Status: corev1.PersistentVolumeClaimStatus{
+							Phase: corev1.ClaimPending,
+						},
+					}
+					withObjs = append(withObjs, pendingPVC)
+
+					importDisk := &vimtypes.VirtualDisk{
+						VirtualDevice: vimtypes.VirtualDevice{
+							Key:           300,
+							ControllerKey: 100,
+							UnitNumber:    ptr.To(int32(0)),
+							Backing: &vimtypes.VirtualDiskFlatVer2BackingInfo{
+								VirtualDeviceFileBackingInfo: vimtypes.VirtualDeviceFileBackingInfo{
+									FileName: importDiskFileName,
+								},
+								Uuid: importDiskUUID,
+							},
+						},
+						CapacityInBytes: 1024 * 1024 * 1024,
+					}
+
+					ideController := &vimtypes.VirtualIDEController{
+						VirtualController: vimtypes.VirtualController{
+							VirtualDevice: vimtypes.VirtualDevice{
+								Key: 100,
+							},
+							BusNumber: 0,
+						},
+					}
+
+					moVM.Config = &vimtypes.VirtualMachineConfigInfo{
+						Hardware: vimtypes.VirtualHardware{
+							Device: []vimtypes.BaseVirtualDevice{
+								ideController,
+								importDisk,
+							},
+						},
+					}
+				})
+
+				When("VMOwnedVolumes is enabled", func() {
+					It("creates CnsRegisterVolume immediately without needing batch cache-miss", func() {
+						// First reconcile: PVC created, returns pending.
+						Expect(unmanagedvolsreg.Reconcile(ctx, k8sClient, vimClient, vm, moVM, configSpec)).
+							To(MatchError(unmanagedvolsreg.ErrPendingRegister))
+
+						// Second reconcile (no batch attachment created): CRV created directly.
+						err := unmanagedvolsreg.Reconcile(ctx, k8sClient, vimClient, vm, moVM, configSpec)
+						Expect(err).To(MatchError(unmanagedvolsreg.ErrPendingRegister))
+
+						crv := &cnsv1alpha1.CnsRegisterVolume{}
+						Expect(k8sClient.Get(ctx, ctrlclient.ObjectKey{
+							Namespace: vm.Namespace,
+							Name:      importPVCName,
+						}, crv)).To(Succeed())
+
+						// Verify deferred-FCD fields are populated.
+						Expect(crv.Spec.DeferFcdRegistration).To(BeTrue())
+						Expect(crv.Spec.VMName).To(Equal(vm.Name))
+						Expect(crv.Spec.VMInstanceUUID).To(Equal(importInstanceUUID))
+						Expect(crv.Spec.DiskUUID).To(Equal(importDiskUUID))
+						Expect(crv.Spec.PvcName).To(Equal(importPVCName))
+					})
+
+					It("is idempotent when CnsRegisterVolume already exists", func() {
+						// First reconcile creates PVC + returns pending.
+						Expect(unmanagedvolsreg.Reconcile(ctx, k8sClient, vimClient, vm, moVM, configSpec)).
+							To(MatchError(unmanagedvolsreg.ErrPendingRegister))
+
+						// Second reconcile creates CRV.
+						Expect(unmanagedvolsreg.Reconcile(ctx, k8sClient, vimClient, vm, moVM, configSpec)).
+							To(MatchError(unmanagedvolsreg.ErrPendingRegister))
+
+						// Third reconcile with CRV already present: no error, CRV is not duplicated.
+						Expect(unmanagedvolsreg.Reconcile(ctx, k8sClient, vimClient, vm, moVM, configSpec)).
+							To(MatchError(unmanagedvolsreg.ErrPendingRegister))
+
+						crvList := &cnsv1alpha1.CnsRegisterVolumeList{}
+						Expect(k8sClient.List(ctx, crvList,
+							ctrlclient.InNamespace(vm.Namespace))).To(Succeed())
+						// Exactly one CRV for this VM.
+						Expect(crvList.Items).To(HaveLen(1))
+					})
+				})
+
+				When("VMOwnedVolumes is disabled (legacy path)", func() {
+					BeforeEach(func() {
+						pkgcfg.SetContext(ctx, func(config *pkgcfg.Config) {
+							config.Features.VMOwnedVolumes = false
+						})
+					})
+
+					It("does not create CnsRegisterVolume without the batch cache-miss signal", func() {
+						// First reconcile: PVC created, returns pending.
+						Expect(unmanagedvolsreg.Reconcile(ctx, k8sClient, vimClient, vm, moVM, configSpec)).
+							To(MatchError(unmanagedvolsreg.ErrPendingRegister))
+
+						// Second reconcile without batch attachment: still pending, no CRV yet.
+						Expect(unmanagedvolsreg.Reconcile(ctx, k8sClient, vimClient, vm, moVM, configSpec)).
+							To(MatchError(unmanagedvolsreg.ErrPendingRegister))
+
+						crv := &cnsv1alpha1.CnsRegisterVolume{}
+						err := k8sClient.Get(ctx, ctrlclient.ObjectKey{
+							Namespace: vm.Namespace,
+							Name:      importPVCName,
+						}, crv)
+						Expect(apierrors.IsNotFound(err)).To(BeTrue())
+					})
+
+					It("creates CnsRegisterVolume without DeferFcdRegistration once batch signals cache-miss", func() {
+						Expect(unmanagedvolsreg.Reconcile(ctx, k8sClient, vimClient, vm, moVM, configSpec)).
+							To(MatchError(unmanagedvolsreg.ErrPendingRegister))
+
+						createBatchAttachWithPVCVolumeIDCacheMiss(ctx, k8sClient, vm, importPVCName)
+
+						Expect(unmanagedvolsreg.Reconcile(ctx, k8sClient, vimClient, vm, moVM, configSpec)).
+							To(MatchError(unmanagedvolsreg.ErrPendingRegister))
+
+						crv := &cnsv1alpha1.CnsRegisterVolume{}
+						Expect(k8sClient.Get(ctx, ctrlclient.ObjectKey{
+							Namespace: vm.Namespace,
+							Name:      importPVCName,
+						}, crv)).To(Succeed())
+
+						// Legacy path: DeferFcdRegistration must NOT be set.
+						Expect(crv.Spec.DeferFcdRegistration).To(BeFalse())
+						Expect(crv.Spec.VMName).To(BeEmpty())
+						Expect(crv.Spec.VMInstanceUUID).To(BeEmpty())
+						Expect(crv.Spec.DiskUUID).To(BeEmpty())
+					})
 				})
 			})
 
