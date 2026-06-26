@@ -245,8 +245,25 @@ func (r *Reconciler) detachOwnedVolume(
 		statusEntry.ControllerBusNumber == nil ||
 		statusEntry.UnitNumber == nil {
 		// The disk is not (or no longer) present on the VM, or slot info is not
-		// yet observed. Remove the VM entry from the CVI so CSI can re-register
-		// once all relationships are gone.
+		// yet observed (e.g. status was wiped by a snapshot revert). Remove the
+		// VM entry from the CVI so CSI can re-register — but ONLY if no VM
+		// snapshot still retains the disk. While a snapshot pins the disk, the
+		// entry is a hold that must persist; removing it would trigger a
+		// premature (and failing) re-registration (spec §5.4, §11.2 E.5).
+		retained, err := vmopv1util.IsDiskRetainedBySnapshot(
+			ctx, r.Client, r.VMProvider, ctx.Logger, vm, "", cvi.Spec.PVCName, cvi.Spec.DiskUUID)
+		if err != nil {
+			return fmt.Errorf("failed to check snapshot retention for CsiVolumeInfo %s: %w", cvi.Name, err)
+		}
+		if retained {
+			ctx.Logger.Info("Disk retained by a VM snapshot; keeping CVI entry",
+				"cvi", cvi.Name, "pvc", cvi.Spec.PVCName)
+			if statusEntry != nil {
+				r.removeVolumeStatus(ctx, statusEntry.Name)
+			}
+			return nil
+		}
+
 		patch := ctrlclient.MergeFrom(cvi.DeepCopy())
 		cvi.Spec.VMs = removeVMEntry(cvi.Spec.VMs, vm.Name)
 		if err := r.Client.Patch(ctx, cvi, patch); err != nil {
@@ -271,12 +288,28 @@ func (r *Reconciler) detachOwnedVolume(
 	ctx.Logger.Info("Removed VM-owned disk from VM",
 		"cvi", cvi.Name, "pvc", cvi.Spec.PVCName, "diskPath", diskPath)
 
-	// Update CsiVolumeInfo: refresh diskPath if it changed, remove VM entry.
+	// Remove the VM entry only if no VM snapshot still retains the disk. The
+	// disk has been removed from the VM, but a snapshot may still pin it — in
+	// that case the entry must stay so CSI does not re-register prematurely
+	// (spec §5.4, §11.2 E.5).
+	retained, err := vmopv1util.IsDiskRetainedBySnapshot(
+		ctx, r.Client, r.VMProvider, ctx.Logger, vm, "", cvi.Spec.PVCName, cvi.Spec.DiskUUID)
+	if err != nil {
+		return fmt.Errorf("failed to check snapshot retention for CsiVolumeInfo %s: %w", cvi.Name, err)
+	}
+
+	// Update CsiVolumeInfo: refresh diskPath if it changed, and remove the VM
+	// entry unless a snapshot retains the disk.
 	patch := ctrlclient.MergeFrom(cvi.DeepCopy())
 	if diskPath != "" && diskPath != cvi.Spec.DiskPath {
 		cvi.Spec.DiskPath = diskPath
 	}
-	cvi.Spec.VMs = removeVMEntry(cvi.Spec.VMs, vm.Name)
+	if retained {
+		ctx.Logger.Info("Disk retained by a VM snapshot; keeping CVI entry after detach",
+			"cvi", cvi.Name, "pvc", cvi.Spec.PVCName)
+	} else {
+		cvi.Spec.VMs = removeVMEntry(cvi.Spec.VMs, vm.Name)
+	}
 	if err := r.Client.Patch(ctx, cvi, patch); err != nil {
 		return fmt.Errorf("failed to patch CsiVolumeInfo after detach for %s: %w", cvi.Name, err)
 	}
