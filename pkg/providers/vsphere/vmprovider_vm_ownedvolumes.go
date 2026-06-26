@@ -258,10 +258,21 @@ func findVirtualDiskAtSlot(
 			return nil, "", fmt.Errorf("unexpected disk backing type at slot (controller=%d unit=%d)", controllerKey, unitNumber)
 		}
 
-		return disk, normalizeBackingFileName(backing.FileName), nil
+		return disk, rootBackingFileName(backing), nil
 	}
 
 	return nil, "", fmt.Errorf("virtual disk not found at slot: controllerKey=%d unitNumber=%d", controllerKey, unitNumber)
+}
+
+// rootBackingFileName walks the backing's Parent chain to the root ancestor —
+// the base FCD VMDK that predates any snapshot redo-log deltas. When a VM
+// has snapshots, the live disk backing has a "-000001" (or higher) suffix;
+// only the root file is registerable by CNS via registerDisk.
+func rootBackingFileName(b *vimtypes.VirtualDiskFlatVer2BackingInfo) string {
+	for b.Parent != nil {
+		b = b.Parent
+	}
+	return normalizeBackingFileName(b.FileName)
 }
 
 // normalizeBackingFileName converts a vCenter HTTP folder URL
