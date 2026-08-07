@@ -117,6 +117,12 @@ type VirtualMachineProviderInterface interface {
 	// is found at that slot.
 	GetDiskPathAtSlot(ctx context.Context, vm *vmopv1.VirtualMachine, controllerType vmopv1.VirtualControllerType, controllerBusNumber, unitNumber int32) (string, error)
 
+	// GetLiveDiskPathAtSlot returns the current, non-base-walked datastore
+	// path of the virtual disk at the given controller slot, without
+	// modifying the VM. Used to refresh CsiVolumeInfo.spec.diskPath before a
+	// detach removes the device (attach/detach §8.2 B.2).
+	GetLiveDiskPathAtSlot(ctx context.Context, vm *vmopv1.VirtualMachine, controllerType vmopv1.VirtualControllerType, controllerBusNumber, unitNumber int32) (string, error)
+
 	// IsDiskRetainedByAnySnapshot queries the live vCenter snapshot tree for the
 	// given VM and reports whether any snapshot — including unmanaged snapshots
 	// that have no VirtualMachineSnapshot CR — retains a virtual disk with the

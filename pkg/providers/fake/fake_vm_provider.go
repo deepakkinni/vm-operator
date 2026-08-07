@@ -73,7 +73,9 @@ type funcs struct {
 	IsDiskRetainedByAnySnapshotFn func(ctx context.Context, vm *vmopv1.VirtualMachine, diskUUID string) (bool, error)
 	GetDiskPathFromSnapshotFn     func(ctx context.Context, vm *vmopv1.VirtualMachine, snapshotName, diskUUID string) (string, error)
 
-	AttachVolumeDisksFn func(ctx context.Context, vm *vmopv1.VirtualMachine, disks []providers.VolumeDiskAddSpec) ([]providers.VolumeDiskPlacement, error)
+	AttachVolumeDisksFn     func(ctx context.Context, vm *vmopv1.VirtualMachine, disks []providers.VolumeDiskAddSpec) ([]providers.VolumeDiskPlacement, error)
+	GetLiveDiskPathAtSlotFn func(ctx context.Context, vm *vmopv1.VirtualMachine, controllerType vmopv1.VirtualControllerType, controllerBusNumber, unitNumber int32) (string, error)
+	DetachDiskAtSlotFn      func(ctx context.Context, vm *vmopv1.VirtualMachine, controllerType vmopv1.VirtualControllerType, controllerBusNumber, unitNumber int32) (string, error)
 }
 
 type VMProvider struct {
@@ -492,7 +494,17 @@ func (s *VMProvider) SyncVMSnapshotTreeStatus(ctx context.Context, vm *vmopv1.Vi
 }
 
 // DetachDiskAtSlot is a no-op stub for the fake provider.
-func (s *VMProvider) DetachDiskAtSlot(_ context.Context, _ *vmopv1.VirtualMachine, _ vmopv1.VirtualControllerType, _, _ int32) (string, error) {
+func (s *VMProvider) DetachDiskAtSlot(
+	ctx context.Context,
+	vm *vmopv1.VirtualMachine,
+	controllerType vmopv1.VirtualControllerType,
+	controllerBusNumber, unitNumber int32) (string, error) {
+
+	s.Lock()
+	defer s.Unlock()
+	if s.DetachDiskAtSlotFn != nil {
+		return s.DetachDiskAtSlotFn(ctx, vm, controllerType, controllerBusNumber, unitNumber)
+	}
 	return "", nil
 }
 
@@ -527,6 +539,21 @@ func (s *VMProvider) GetPVCDiskDataFromSnapshot(ctx context.Context, vm *vmopv1.
 
 // GetDiskPathAtSlot is a no-op stub for the fake provider.
 func (s *VMProvider) GetDiskPathAtSlot(_ context.Context, _ *vmopv1.VirtualMachine, _ vmopv1.VirtualControllerType, _, _ int32) (string, error) {
+	return "", nil
+}
+
+// GetLiveDiskPathAtSlot delegates to GetLiveDiskPathAtSlotFn if set.
+func (s *VMProvider) GetLiveDiskPathAtSlot(
+	ctx context.Context,
+	vm *vmopv1.VirtualMachine,
+	controllerType vmopv1.VirtualControllerType,
+	controllerBusNumber, unitNumber int32) (string, error) {
+
+	s.Lock()
+	defer s.Unlock()
+	if s.GetLiveDiskPathAtSlotFn != nil {
+		return s.GetLiveDiskPathAtSlotFn(ctx, vm, controllerType, controllerBusNumber, unitNumber)
+	}
 	return "", nil
 }
 

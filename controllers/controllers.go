@@ -10,6 +10,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"github.com/vmware-tanzu/vm-operator/controllers/contentlibrary"
+	"github.com/vmware-tanzu/vm-operator/controllers/csivolumeinfo"
 	"github.com/vmware-tanzu/vm-operator/controllers/infra"
 	"github.com/vmware-tanzu/vm-operator/controllers/storage"
 	"github.com/vmware-tanzu/vm-operator/controllers/virtualmachine"
@@ -88,6 +89,12 @@ func AddToManager(ctx *pkgctx.ControllerManagerContext, mgr manager.Manager) err
 	if pkgcfg.FromContext(ctx).Features.VSpherePolicies {
 		if err := vspherepolicy.AddToManager(ctx, mgr); err != nil {
 			return fmt.Errorf("failed to initialize vSphere Policy controllers: %w", err)
+		}
+	}
+
+	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes {
+		if err := csivolumeinfo.AddToManager(ctx, mgr); err != nil {
+			return fmt.Errorf("failed to initialize CsiVolumeInfo sweeper controller: %w", err)
 		}
 	}
 

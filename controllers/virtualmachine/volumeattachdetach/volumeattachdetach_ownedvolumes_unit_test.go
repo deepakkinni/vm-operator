@@ -326,6 +326,179 @@ var _ = Describe(
 						})
 					})
 
+					// Detach with a resolvable device slot: the CVI entry pairs to
+					// the vm.status.volumes entry by volumeName (D2), never by
+					// diskUUID (§4.2.2). Verifies the ordering rule (§8.2 B.2):
+					// diskPath is refreshed from the live device BEFORE the device
+					// is removed.
+					When("a dependent CVI references the VM and the disk is still attached at a known slot", func() {
+						const (
+							detachPVC   = "detached-pvc-slot"
+							detachVolID = "vol-detach-slot"
+						)
+
+						busNumber := int32(0)
+						unitNumber := int32(3)
+
+						getCVI := func() *cnsv1alpha1.CsiVolumeInfo {
+							cvi := &cnsv1alpha1.CsiVolumeInfo{}
+							Expect(ctx.Client.Get(ctx, client.ObjectKey{
+								Name:      vmopv1util.CVINameForVolumeID(detachVolID),
+								Namespace: cnsv1alpha1.CVINamespace,
+							}, cvi)).To(Succeed())
+							return cvi
+						}
+
+						BeforeEach(func() {
+							vm.Spec.Volumes = nil
+							vm.Status.Volumes = []vmopv1.VirtualMachineVolumeStatus{
+								{
+									Name:                "vol-detach-slot",
+									Type:                vmopv1.VolumeTypeManaged,
+									DiskUUID:            "disk-uuid-detach-slot",
+									Attached:            true,
+									ControllerType:      vmopv1.VirtualControllerTypeSCSI,
+									ControllerBusNumber: &busNumber,
+									UnitNumber:          &unitNumber,
+								},
+							}
+							cvi := &cnsv1alpha1.CsiVolumeInfo{
+								ObjectMeta: metav1.ObjectMeta{
+									Name:      vmopv1util.CVINameForVolumeID(detachVolID),
+									Namespace: cnsv1alpha1.CVINamespace,
+								},
+								Spec: cnsv1alpha1.CsiVolumeInfoSpec{
+									VolumeID:     detachVolID,
+									PVCName:      detachPVC,
+									PVCNamespace: ns,
+									DiskUUID:     "disk-uuid-detach-slot",
+									DiskPath:     "[ds1] stale-path.vmdk",
+									VMs: []cnsv1alpha1.VirtualMachineRef{
+										{VMName: vmName, VolumeName: "vol-detach-slot"},
+									},
+								},
+								Status: cnsv1alpha1.CsiVolumeInfoStatus{
+									Ownership: cnsv1alpha1.OwnershipStateVMManaged,
+									Phase:     cnsv1alpha1.PhaseSucceeded,
+								},
+							}
+							initObjects = append(initObjects, cvi)
+						})
+
+						It("refreshes diskPath from the live device before removing it, then removes the entry and status", func() {
+							var order []string
+							ctx.VMProvider.(*providerfake.VMProvider).GetLiveDiskPathAtSlotFn = func(
+								_ context.Context, _ *vmopv1.VirtualMachine, _ vmopv1.VirtualControllerType, _, _ int32,
+							) (string, error) {
+								order = append(order, "read")
+								return "[ds1] current-path.vmdk", nil
+							}
+							ctx.VMProvider.(*providerfake.VMProvider).DetachDiskAtSlotFn = func(
+								_ context.Context, _ *vmopv1.VirtualMachine, _ vmopv1.VirtualControllerType, _, _ int32,
+							) (string, error) {
+								order = append(order, "remove")
+								// The CVI must already carry the refreshed path by the
+								// time the device is actually removed.
+								Expect(getCVI().Spec.DiskPath).To(Equal("[ds1] current-path.vmdk"))
+								return "[ds1] current-path.vmdk", nil
+							}
+
+							err := reconciler.ReconcileNormal(volCtx)
+							Expect(err).ToNot(HaveOccurred())
+
+							Expect(order).To(Equal([]string{"read", "remove"}),
+								"the live path must be read (and the CVI patched) before the device is removed")
+
+							cvi := getCVI()
+							Expect(cvi.Spec.DiskPath).To(Equal("[ds1] current-path.vmdk"))
+							Expect(vmopv1util.VMEntry(cvi, vmName)).To(BeNil())
+							Expect(vm.Status.Volumes).To(BeEmpty())
+						})
+					})
+
+					// Independent detach (§8.5): remove the device and the entry,
+					// done. No diskPath refresh and no retention check — an
+					// independent disk is never in a VM snapshot.
+					When("an independent CVI references the VM and the disk is attached at a known slot", func() {
+						const (
+							detachPVC   = "detached-pvc-indep"
+							detachVolID = "vol-detach-indep"
+						)
+
+						busNumber := int32(0)
+						unitNumber := int32(4)
+
+						getCVI := func() *cnsv1alpha1.CsiVolumeInfo {
+							cvi := &cnsv1alpha1.CsiVolumeInfo{}
+							Expect(ctx.Client.Get(ctx, client.ObjectKey{
+								Name:      vmopv1util.CVINameForVolumeID(detachVolID),
+								Namespace: cnsv1alpha1.CVINamespace,
+							}, cvi)).To(Succeed())
+							return cvi
+						}
+
+						BeforeEach(func() {
+							vm.Spec.Volumes = nil
+							vm.Status.Volumes = []vmopv1.VirtualMachineVolumeStatus{
+								{
+									Name:                "vol-detach-indep",
+									Type:                vmopv1.VolumeTypeManaged,
+									DiskUUID:            "disk-uuid-detach-indep",
+									Attached:            true,
+									ControllerType:      vmopv1.VirtualControllerTypeSCSI,
+									ControllerBusNumber: &busNumber,
+									UnitNumber:          &unitNumber,
+								},
+							}
+							cvi := &cnsv1alpha1.CsiVolumeInfo{
+								ObjectMeta: metav1.ObjectMeta{
+									Name:      vmopv1util.CVINameForVolumeID(detachVolID),
+									Namespace: cnsv1alpha1.CVINamespace,
+								},
+								Spec: cnsv1alpha1.CsiVolumeInfoSpec{
+									VolumeID:     detachVolID,
+									PVCName:      detachPVC,
+									PVCNamespace: ns,
+									VMs: []cnsv1alpha1.VirtualMachineRef{
+										{
+											VMName:     vmName,
+											VolumeName: "vol-detach-indep",
+											DiskMode:   cnsv1alpha1.CVIDiskModeIndependentPersistent,
+										},
+									},
+								},
+							}
+							initObjects = append(initObjects, cvi)
+						})
+
+						It("removes the device and the entry without refreshing diskPath or checking retention", func() {
+							liveReadCalled := false
+							retentionCalled := false
+							ctx.VMProvider.(*providerfake.VMProvider).GetLiveDiskPathAtSlotFn = func(
+								_ context.Context, _ *vmopv1.VirtualMachine, _ vmopv1.VirtualControllerType, _, _ int32,
+							) (string, error) {
+								liveReadCalled = true
+								return "[ds1] unexpected.vmdk", nil
+							}
+							ctx.VMProvider.(*providerfake.VMProvider).IsDiskRetainedByAnySnapshotFn =
+								func(_ context.Context, _ *vmopv1.VirtualMachine, _ string) (bool, error) {
+									retentionCalled = true
+									return false, nil
+								}
+
+							err := reconciler.ReconcileNormal(volCtx)
+							Expect(err).ToNot(HaveOccurred())
+
+							Expect(liveReadCalled).To(BeFalse(), "independent detach must not refresh diskPath")
+							Expect(retentionCalled).To(BeFalse(), "independent disks are never snapshot-retained")
+
+							cvi := getCVI()
+							Expect(cvi.Spec.DiskPath).To(BeEmpty())
+							Expect(vmopv1util.VMEntry(cvi, vmName)).To(BeNil())
+							Expect(vm.Status.Volumes).To(BeEmpty())
+						})
+					})
+
 					When("VM has a volume with IndependentPersistent diskMode", func() {
 						BeforeEach(func() {
 							pvc, pv, cvi := buildPVCWithCVI(pvcName, pvName, volID)
@@ -410,7 +583,7 @@ var _ = Describe(
 							// Pre-set the VM entry so the reconciler skips the patch
 							// step and proceeds directly to attach.
 							cvi.Spec.VMs = []cnsv1alpha1.VirtualMachineRef{
-								{VMName: vmName},
+								{VMName: vmName, VolumeName: "vol-persistent"},
 							}
 							cvi.Spec.DiskUUID = "disk-uuid-abc"
 							initObjects = append(initObjects, pvc, pv, cvi)
@@ -446,7 +619,7 @@ var _ = Describe(
 						BeforeEach(func() {
 							pvc, pv, cvi := buildPVCWithCVI(pvcName, pvName, volID)
 							cvi.Spec.VMs = []cnsv1alpha1.VirtualMachineRef{
-								{VMName: vmName},
+								{VMName: vmName, VolumeName: "vol-persistent"},
 							}
 							// fcd-retained: spec.diskUUID is never populated (csi.md C4).
 							cvi.Spec.DiskUUID = ""
@@ -629,9 +802,9 @@ var _ = Describe(
 							pvc1, pv1, cvi1 := buildPVCWithCVI(pvcName, pvName, volID)
 							pvc2, pv2, cvi2 := buildPVCWithCVI(pvcName2, pvName2, volID2)
 							// Pre-set VM entries and distinct DiskUUIDs on both CVIs.
-							cvi1.Spec.VMs = []cnsv1alpha1.VirtualMachineRef{{VMName: vm.Name}}
+							cvi1.Spec.VMs = []cnsv1alpha1.VirtualMachineRef{{VMName: vm.Name, VolumeName: "vol-1"}}
 							cvi1.Spec.DiskUUID = "disk-uuid-111"
-							cvi2.Spec.VMs = []cnsv1alpha1.VirtualMachineRef{{VMName: vm.Name}}
+							cvi2.Spec.VMs = []cnsv1alpha1.VirtualMachineRef{{VMName: vm.Name, VolumeName: "vol-2"}}
 							cvi2.Spec.DiskUUID = "disk-uuid-222"
 							initObjects = append(initObjects, pvc1, pv1, cvi1, pvc2, pv2, cvi2)
 
@@ -712,7 +885,7 @@ var _ = Describe(
 							pvc2, pv2, cvi2 := buildPVCWithCVI(pvcName2, pvName2, volID2)
 							// vol-1: no VM entry (needs patching, not yet green).
 							// vol-2: VM entry present, green signal already set.
-							cvi2.Spec.VMs = []cnsv1alpha1.VirtualMachineRef{{VMName: vm.Name}}
+							cvi2.Spec.VMs = []cnsv1alpha1.VirtualMachineRef{{VMName: vm.Name, VolumeName: "vol-2"}}
 							cvi2.Spec.DiskUUID = "disk-uuid-222"
 							initObjects = append(initObjects, pvc1, pv1, cvi1, pvc2, pv2, cvi2)
 

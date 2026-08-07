@@ -376,10 +376,22 @@ func (vs *vSphereVMProvider) DetachDiskAtSlot(
 		return "", fmt.Errorf("failed to get VM hardware devices: %w", err)
 	}
 
-	disk, diskPath, err := findVirtualDiskAtSlot(moVM, controllerType, controllerBusNumber, unitNumber)
+	disk, err := findVirtualDiskDeviceAtSlot(moVM, controllerType, controllerBusNumber, unitNumber)
 	if err != nil {
 		return "", fmt.Errorf("failed to find virtual disk at slot: %w", err)
 	}
+
+	// The disk's own backing path, not its root ancestor (attach/detach
+	// §8.2 B.2, §4.2.2) — a VM-owned volume's live disk is a plain VMDK, so
+	// there is no redo-log chain to walk past, and base-walking here would
+	// feed the wrong path back to CSI. rootBackingFileName stays reserved
+	// for the snapshot-context callers that genuinely want the base disk.
+	backing, ok := disk.Backing.(*vimtypes.VirtualDiskFlatVer2BackingInfo)
+	if !ok {
+		return "", fmt.Errorf("unexpected disk backing type at slot (%s bus=%d unit=%d)",
+			controllerType, controllerBusNumber, unitNumber)
+	}
+	diskPath := normalizeBackingFileName(backing.FileName)
 
 	configSpec := &vimtypes.VirtualMachineConfigSpec{
 		DeviceChange: []vimtypes.BaseVirtualDeviceConfigSpec{
@@ -403,17 +415,90 @@ func (vs *vSphereVMProvider) DetachDiskAtSlot(
 	return diskPath, nil
 }
 
+// GetLiveDiskPathAtSlot returns the current, non-base-walked datastore path
+// of the virtual disk at the given controller slot, without modifying the
+// VM. Used to refresh CsiVolumeInfo.spec.diskPath before a detach removes
+// the device — after removal the live VM no longer carries the path
+// (attach/detach §8.2 B.2).
+func (vs *vSphereVMProvider) GetLiveDiskPathAtSlot(
+	ctx context.Context,
+	vm *vmopv1.VirtualMachine,
+	controllerType vmopv1.VirtualControllerType,
+	controllerBusNumber, unitNumber int32) (string, error) {
+
+	vmCtx := pkgctx.NewVirtualMachineContext(
+		pkgctx.WithVCOpID(ctx, vm, "getLiveDiskPathAtSlot"),
+		vm,
+	)
+
+	client, err := vs.getVcClient(vmCtx)
+	if err != nil {
+		return "", fmt.Errorf("failed to get vCenter client: %w", err)
+	}
+
+	vcVM, err := vs.getVM(vmCtx, client, true)
+	if err != nil {
+		return "", fmt.Errorf("failed to get VM from vCenter: %w", err)
+	}
+
+	resVM := res.NewVMFromObject(vcVM)
+
+	moVM, err := resVM.GetProperties(vmCtx, []string{"config.hardware.device"})
+	if err != nil {
+		return "", fmt.Errorf("failed to get VM hardware devices: %w", err)
+	}
+
+	disk, err := findVirtualDiskDeviceAtSlot(moVM, controllerType, controllerBusNumber, unitNumber)
+	if err != nil {
+		return "", fmt.Errorf("failed to find virtual disk at slot: %w", err)
+	}
+
+	backing, ok := disk.Backing.(*vimtypes.VirtualDiskFlatVer2BackingInfo)
+	if !ok {
+		return "", fmt.Errorf("unexpected disk backing type at slot (%s bus=%d unit=%d)",
+			controllerType, controllerBusNumber, unitNumber)
+	}
+
+	return normalizeBackingFileName(backing.FileName), nil
+}
+
 // findVirtualDiskAtSlot locates the VirtualDisk device in the moVM device
 // list that is attached to the controller identified by controllerType,
-// controllerBusNumber, and unitNumber. It returns the device and its VMDK
-// datastore path.
+// controllerBusNumber, and unitNumber. It returns the device and its root
+// VMDK datastore path — the base disk that predates any snapshot redo-log
+// deltas, which is what CNS's registerDisk requires. This walk is only
+// correct for the snapshot-context callers that genuinely want the base
+// disk; a live-VM detach must use findVirtualDiskDeviceAtSlot instead
+// (attach/detach §8.2 B.2).
 func findVirtualDiskAtSlot(
 	moVM *mo.VirtualMachine,
 	controllerType vmopv1.VirtualControllerType,
 	controllerBusNumber, unitNumber int32) (vimtypes.BaseVirtualDevice, string, error) {
 
+	disk, err := findVirtualDiskDeviceAtSlot(moVM, controllerType, controllerBusNumber, unitNumber)
+	if err != nil {
+		return nil, "", err
+	}
+
+	backing, ok := disk.Backing.(*vimtypes.VirtualDiskFlatVer2BackingInfo)
+	if !ok {
+		return nil, "", fmt.Errorf("unexpected disk backing type at slot (%s bus=%d unit=%d)",
+			controllerType, controllerBusNumber, unitNumber)
+	}
+
+	return disk, rootBackingFileName(backing), nil
+}
+
+// findVirtualDiskDeviceAtSlot locates the VirtualDisk device in the moVM
+// device list that is attached to the controller identified by
+// controllerType, controllerBusNumber, and unitNumber.
+func findVirtualDiskDeviceAtSlot(
+	moVM *mo.VirtualMachine,
+	controllerType vmopv1.VirtualControllerType,
+	controllerBusNumber, unitNumber int32) (*vimtypes.VirtualDisk, error) {
+
 	if moVM.Config == nil {
-		return nil, "", fmt.Errorf("VM config is nil")
+		return nil, fmt.Errorf("VM config is nil")
 	}
 
 	// Find the controller device matching the type and bus number.
@@ -459,7 +544,7 @@ func findVirtualDiskAtSlot(
 	}
 
 	if !found {
-		return nil, "", fmt.Errorf("controller not found: type=%s busNumber=%d", controllerType, controllerBusNumber)
+		return nil, fmt.Errorf("controller not found: type=%s busNumber=%d", controllerType, controllerBusNumber)
 	}
 
 	// Find the VirtualDisk with the matching controller key and unit number.
@@ -476,16 +561,10 @@ func findVirtualDiskAtSlot(
 			continue
 		}
 
-		// Extract the VMDK path from the backing.
-		backing, ok := disk.Backing.(*vimtypes.VirtualDiskFlatVer2BackingInfo)
-		if !ok {
-			return nil, "", fmt.Errorf("unexpected disk backing type at slot (controller=%d unit=%d)", controllerKey, unitNumber)
-		}
-
-		return disk, rootBackingFileName(backing), nil
+		return disk, nil
 	}
 
-	return nil, "", fmt.Errorf("virtual disk not found at slot: controllerKey=%d unitNumber=%d", controllerKey, unitNumber)
+	return nil, fmt.Errorf("virtual disk not found at slot: controllerKey=%d unitNumber=%d", controllerKey, unitNumber)
 }
 
 // rootBackingFileName walks the backing's Parent chain to the root ancestor —

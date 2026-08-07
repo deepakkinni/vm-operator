@@ -131,21 +131,29 @@ func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error
 		}
 
 		entry := vmopv1util.VMEntry(cvi, vm.Name)
-		if entry == nil || vmopv1util.NormalizeDiskMode(entry.DiskMode) != plan.DiskMode {
+		if entry == nil ||
+			vmopv1util.NormalizeDiskMode(entry.DiskMode) != plan.DiskMode ||
+			entry.VolumeName != plan.VolumeName {
 			// Append or update this VM's entry and patch. An already-present
-			// entry whose DiskMode differs is updated in place — this is what
-			// makes a VKS disk-mode conversion (V12) converge.
+			// entry whose DiskMode or VolumeName differs is updated in
+			// place. The DiskMode update is what makes a VKS disk-mode
+			// conversion (V12) converge; the VolumeName update backfills
+			// entries written before D2 existed (or by migration, V11) so
+			// an upgraded operator self-heals before the first detach
+			// (attach/detach §4.1.7, V5 risk).
 			patch := ctrlclient.MergeFrom(cvi.DeepCopy())
 			if entry == nil {
 				cvi.Spec.VMs = append(cvi.Spec.VMs, cnsv1alpha1.VirtualMachineRef{
 					VMName:         vm.Name,
 					VMInstanceUUID: vm.Status.InstanceUUID,
 					DiskMode:       plan.DiskMode,
+					VolumeName:     plan.VolumeName,
 				})
 			} else {
 				for i := range cvi.Spec.VMs {
 					if cvi.Spec.VMs[i].VMName == vm.Name {
 						cvi.Spec.VMs[i].DiskMode = plan.DiskMode
+						cvi.Spec.VMs[i].VolumeName = plan.VolumeName
 					}
 				}
 			}
@@ -153,7 +161,7 @@ func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error
 				return fmt.Errorf("failed to patch CsiVolumeInfo spec.vms for PVC %s: %w", claimName, err)
 			}
 			ctx.Logger.Info("Wrote VM entry to CsiVolumeInfo spec.vms for attach",
-				"pvc", claimName, "cvi", cvi.Name, "diskMode", plan.DiskMode)
+				"pvc", claimName, "cvi", cvi.Name, "diskMode", plan.DiskMode, "volumeName", plan.VolumeName)
 			needRequeue = true
 			continue
 		}
@@ -330,111 +338,156 @@ func (r *Reconciler) reconcileOwnedVolumeDetach(
 	return nil
 }
 
-// detachOwnedVolume detaches the disk backed by the given CsiVolumeInfo from the
-// VM (if still present), removes this VM's entry from the CVI, and clears the
-// corresponding VM status entry.
+// detachOwnedVolume detaches the disk backed by the given CsiVolumeInfo from
+// the VM (if still present), removes this VM's entry from the CVI, and
+// clears the corresponding VM status entry. Handles both ownership
+// behaviors (attach/detach §8.2 dependent, §8.5 independent).
+//
+// The device is located by pairing the CVI entry's volumeName to the
+// vm.status.volumes entry it names, never by diskUUID (§4.2.2) — a diskUUID
+// pairing returns nothing for an fcd-retained volume, whose spec.diskUUID is
+// empty, and cannot survive more than one volume being removed from
+// vm.spec.volumes in the same edit. If volumeName resolves to no status
+// entry — a stale value, a status wiped by a snapshot revert, or a slot
+// never observed — no ReconfigVM is issued; the volume falls through to the
+// same disk-not-on-VM handling as a disk that was already removed
+// out-of-band.
 func (r *Reconciler) detachOwnedVolume(
 	ctx *pkgctx.VolumeContext,
 	cvi *cnsv1alpha1.CsiVolumeInfo) error {
 
 	vm := ctx.VM
 
-	// Correlate the CVI to the VM status entry via the disk UUID, which is
-	// recorded on both the CVI (spec.diskUUID) and the VM status volume
-	// (status.volumes[*].diskUUID). This is the only reliable correlation key
-	// once the volume has been removed from vm.spec.volumes.
-	statusEntry := r.findVolumeStatusByDiskUUID(ctx, cvi.Spec.DiskUUID)
+	entry := vmopv1util.VMEntry(cvi, vm.Name)
+	if entry == nil {
+		// Caller already checked this; nothing to do.
+		return nil
+	}
+	dependent := vmopv1util.IsDependentMode(entry.DiskMode)
+
+	statusEntry := findVolumeStatusByName(vm, entry.VolumeName)
 
 	if statusEntry == nil ||
 		statusEntry.ControllerBusNumber == nil ||
 		statusEntry.UnitNumber == nil {
-		// The disk is not (or no longer) present on the VM, or slot info is not
-		// yet observed (e.g. status was wiped by a snapshot revert). Remove the
-		// VM entry from the CVI so CSI can re-register — but ONLY if no VM
-		// snapshot still retains the disk. While a snapshot pins the disk, the
-		// entry is a hold that must persist; removing it would trigger a
-		// premature (and failing) re-registration (spec §5.4, §11.2 E.5).
-		retained, err := vmopv1util.IsDiskRetainedBySnapshot(
-			ctx, r.Client, r.VMProvider, ctx.Logger, vm, "", cvi.Spec.PVCName, cvi.Spec.DiskUUID)
-		if err != nil {
-			return fmt.Errorf("failed to check snapshot retention for CsiVolumeInfo %s: %w", cvi.Name, err)
-		}
-		if retained {
-			ctx.Logger.Info("Disk retained by a VM snapshot; keeping CVI entry",
-				"cvi", cvi.Name, "pvc", cvi.Spec.PVCName)
-			if statusEntry != nil {
-				r.removeVolumeStatus(ctx, statusEntry.Name)
-			}
-			return nil
-		}
-
-		patch := ctrlclient.MergeFrom(cvi.DeepCopy())
-		cvi.Spec.VMs = removeVMEntry(cvi.Spec.VMs, vm.Name)
-		if err := r.Client.Patch(ctx, cvi, patch); err != nil {
-			return fmt.Errorf("failed to patch CsiVolumeInfo %s during detach: %w", cvi.Name, err)
-		}
-		if statusEntry != nil {
-			r.removeVolumeStatus(ctx, statusEntry.Name)
-		}
-		return nil
+		return r.removeCVIEntryIfNotRetained(ctx, cvi, statusEntry, dependent)
 	}
 
-	diskPath, err := r.VMProvider.DetachDiskAtSlot(
+	if !dependent {
+		// Independent: remove the device and the entry, done. No diskPath
+		// refresh — the FCD stays registered and CSIManaged, so
+		// spec.diskPath is never consumed for it — and no re-registration
+		// follows (§8.5). The finalizer and fcd-retained machinery never
+		// apply; they exist only for VMManaged (dependent) volumes.
+		if _, err := r.VMProvider.DetachDiskAtSlot(
+			ctx, vm,
+			statusEntry.ControllerType,
+			*statusEntry.ControllerBusNumber,
+			*statusEntry.UnitNumber,
+		); err != nil {
+			return fmt.Errorf("failed to detach independent disk for CsiVolumeInfo %s: %w", cvi.Name, err)
+		}
+		ctx.Logger.Info("Removed independent VM-owned disk from VM",
+			"cvi", cvi.Name, "pvc", cvi.Spec.PVCName)
+
+		return r.removeCVIEntryIfNotRetained(ctx, cvi, statusEntry, false)
+	}
+
+	// Dependent: refresh spec.diskPath from the live device BEFORE the
+	// remove. After the device is gone the live VM no longer carries the
+	// path (§8.2 B.2) — this ordering is what makes re-registration correct
+	// after a storage vMotion. The value written is the device's own
+	// backing path, not its root ancestor; base-walking here would feed the
+	// wrong path back to CSI.
+	livePath, err := r.VMProvider.GetLiveDiskPathAtSlot(
 		ctx, vm,
 		statusEntry.ControllerType,
 		*statusEntry.ControllerBusNumber,
 		*statusEntry.UnitNumber,
 	)
 	if err != nil {
+		return fmt.Errorf("failed to read live disk path for CsiVolumeInfo %s: %w", cvi.Name, err)
+	}
+	if livePath != "" && livePath != cvi.Spec.DiskPath {
+		patch := ctrlclient.MergeFrom(cvi.DeepCopy())
+		cvi.Spec.DiskPath = livePath
+		if err := r.Client.Patch(ctx, cvi, patch); err != nil {
+			return fmt.Errorf("failed to refresh CsiVolumeInfo diskPath before detach for %s: %w", cvi.Name, err)
+		}
+	}
+
+	if _, err := r.VMProvider.DetachDiskAtSlot(
+		ctx, vm,
+		statusEntry.ControllerType,
+		*statusEntry.ControllerBusNumber,
+		*statusEntry.UnitNumber,
+	); err != nil {
 		return fmt.Errorf("failed to detach disk for CsiVolumeInfo %s: %w", cvi.Name, err)
 	}
 
-	ctx.Logger.Info("Removed VM-owned disk from VM",
-		"cvi", cvi.Name, "pvc", cvi.Spec.PVCName, "diskPath", diskPath)
+	ctx.Logger.Info("Removed VM-owned disk from VM", "cvi", cvi.Name, "pvc", cvi.Spec.PVCName)
 
-	// Remove the VM entry only if no VM snapshot still retains the disk. The
-	// disk has been removed from the VM, but a snapshot may still pin it — in
-	// that case the entry must stay so CSI does not re-register prematurely
-	// (spec §5.4, §11.2 E.5).
-	retained, err := vmopv1util.IsDiskRetainedBySnapshot(
-		ctx, r.Client, r.VMProvider, ctx.Logger, vm, "", cvi.Spec.PVCName, cvi.Spec.DiskUUID)
-	if err != nil {
-		return fmt.Errorf("failed to check snapshot retention for CsiVolumeInfo %s: %w", cvi.Name, err)
+	return r.removeCVIEntryIfNotRetained(ctx, cvi, statusEntry, dependent)
+}
+
+// removeCVIEntryIfNotRetained removes this VM's entry from the CVI — so CSI
+// can re-register the volume — and the corresponding VM status entry, if
+// any. It does neither while a VM snapshot still retains the disk: the
+// entry is a hold that must persist, and removing it would trigger a
+// premature (and failing) re-registration (spec §5.4, §11.2 E.5).
+//
+// The retention check itself is skipped for an independent disk rather than
+// evaluated and discarded: independent disks are excluded from VM snapshots
+// by vSphere, so the check is a guaranteed false for them, and skipping it
+// avoids paying for a snapshot-tree walk on every independent detach.
+func (r *Reconciler) removeCVIEntryIfNotRetained(
+	ctx *pkgctx.VolumeContext,
+	cvi *cnsv1alpha1.CsiVolumeInfo,
+	statusEntry *vmopv1.VirtualMachineVolumeStatus,
+	dependent bool) error {
+
+	vm := ctx.VM
+
+	var retained bool
+	if dependent {
+		var err error
+		retained, err = vmopv1util.IsDiskRetainedBySnapshot(
+			ctx, r.Client, r.VMProvider, ctx.Logger, vm, "", cvi.Spec.PVCName, cvi.Spec.DiskUUID)
+		if err != nil {
+			return fmt.Errorf("failed to check snapshot retention for CsiVolumeInfo %s: %w", cvi.Name, err)
+		}
 	}
 
-	// Update CsiVolumeInfo: refresh diskPath if it changed, and remove the VM
-	// entry unless a snapshot retains the disk.
-	patch := ctrlclient.MergeFrom(cvi.DeepCopy())
-	if diskPath != "" && diskPath != cvi.Spec.DiskPath {
-		cvi.Spec.DiskPath = diskPath
-	}
 	if retained {
-		ctx.Logger.Info("Disk retained by a VM snapshot; keeping CVI entry after detach",
+		ctx.Logger.Info("Disk retained by a VM snapshot; keeping CVI entry",
 			"cvi", cvi.Name, "pvc", cvi.Spec.PVCName)
-	} else {
-		cvi.Spec.VMs = removeVMEntry(cvi.Spec.VMs, vm.Name)
+		if statusEntry != nil {
+			r.removeVolumeStatus(ctx, statusEntry.Name)
+		}
+		return nil
 	}
+
+	patch := ctrlclient.MergeFrom(cvi.DeepCopy())
+	cvi.Spec.VMs = removeVMEntry(cvi.Spec.VMs, vm.Name)
 	if err := r.Client.Patch(ctx, cvi, patch); err != nil {
-		return fmt.Errorf("failed to patch CsiVolumeInfo after detach for %s: %w", cvi.Name, err)
+		return fmt.Errorf("failed to patch CsiVolumeInfo %s during detach: %w", cvi.Name, err)
 	}
-
-	r.removeVolumeStatus(ctx, statusEntry.Name)
-
+	if statusEntry != nil {
+		r.removeVolumeStatus(ctx, statusEntry.Name)
+	}
 	return nil
 }
 
-// findVolumeStatusByDiskUUID returns the managed VM status volume entry whose
-// DiskUUID matches the given UUID, or nil if none match (or the UUID is empty).
-func (r *Reconciler) findVolumeStatusByDiskUUID(
-	ctx *pkgctx.VolumeContext,
-	diskUUID string) *vmopv1.VirtualMachineVolumeStatus {
-
-	if diskUUID == "" {
+// findVolumeStatusByName returns the managed VM status volume entry with the
+// given name, or nil if none match (or the name is empty — an entry whose
+// volumeName has not yet been backfilled).
+func findVolumeStatusByName(vm *vmopv1.VirtualMachine, volumeName string) *vmopv1.VirtualMachineVolumeStatus {
+	if volumeName == "" {
 		return nil
 	}
-	for i := range ctx.VM.Status.Volumes {
-		vs := &ctx.VM.Status.Volumes[i]
-		if vs.Type == vmopv1.VolumeTypeManaged && vs.DiskUUID == diskUUID {
+	for i := range vm.Status.Volumes {
+		vs := &vm.Status.Volumes[i]
+		if vs.Type == vmopv1.VolumeTypeManaged && vs.Name == volumeName {
 			return vs
 		}
 	}
