@@ -455,7 +455,7 @@ func (r *Reconciler) ReconcileNormal(ctx *pkgctx.VolumeContext) error {
 	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes &&
 		vmopv1util.HasVMOwnedVolumesAnnotation(ctx.VM) {
 		for _, vol := range ctx.VM.Spec.Volumes {
-			if vol.PersistentVolumeClaim != nil && vmopv1util.IsDependentPersistentMode(vol) {
+			if vol.PersistentVolumeClaim != nil && vmopv1util.IsDependentMode(vmopv1util.DiskModeForVolume(vol)) {
 				ownedVolumeNames[vol.Name] = struct{}{}
 			}
 		}
@@ -1374,7 +1374,7 @@ func categorizeVolumeSpecs(
 
 		// Dependent-persistent volumes on VM-owned-volumes VMs are handled
 		// exclusively by the CsiVolumeInfo path — exclude them from batch.
-		if isOwnedVM && vmopv1util.IsDependentPersistentMode(vol) {
+		if isOwnedVM && vmopv1util.IsDependentMode(vmopv1util.DiskModeForVolume(vol)) {
 			continue
 		}
 

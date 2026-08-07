@@ -781,12 +781,12 @@ func unitTestsOwnedVolumesDiskPathRefresh() {
 		cvi = &cnsv1alpha1.CsiVolumeInfo{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      vmopv1util.CVINameForVolumeID(diskUUID),
-				Namespace: constants.CVISystemNamespace,
+				Namespace: cnsv1alpha1.CVINamespace,
 			},
 			Spec: cnsv1alpha1.CsiVolumeInfoSpec{
 				VolumeID: diskUUID,
 				DiskPath: deltaPath, // stale delta path — this is the bug state
-				VMs: []cnsv1alpha1.CsiVolumeInfoVMEntry{
+				VMs: []cnsv1alpha1.VirtualMachineRef{
 					{VMName: vmName},
 				},
 			},
@@ -852,7 +852,7 @@ func unitTestsOwnedVolumesDiskPathRefresh() {
 				updated := &cnsv1alpha1.CsiVolumeInfo{}
 				Expect(ctx.Client.Get(ctx,
 					types.NamespacedName{
-						Namespace: constants.CVISystemNamespace,
+						Namespace: cnsv1alpha1.CVINamespace,
 						Name:      vmopv1util.CVINameForVolumeID(diskUUID),
 					}, updated)).To(Succeed())
 				Expect(updated.Spec.DiskPath).To(Equal(basePath))
@@ -880,7 +880,7 @@ func unitTestsOwnedVolumesDiskPathRefresh() {
 				updated := &cnsv1alpha1.CsiVolumeInfo{}
 				Expect(ctx.Client.Get(ctx,
 					types.NamespacedName{
-						Namespace: constants.CVISystemNamespace,
+						Namespace: cnsv1alpha1.CVINamespace,
 						Name:      vmopv1util.CVINameForVolumeID(diskUUID),
 					}, updated)).To(Succeed())
 				// DiskPath must not have been updated on error.

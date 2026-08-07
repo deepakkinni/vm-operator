@@ -91,7 +91,7 @@ func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error
 		}
 
 		// Only dependent-persistent mode uses the VM-owned path.
-		if !vmopv1util.IsDependentPersistentMode(vol) {
+		if !vmopv1util.IsDependentMode(vmopv1util.DiskModeForVolume(vol)) {
 			continue
 		}
 
@@ -113,12 +113,12 @@ func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error
 			return fmt.Errorf("failed to get CsiVolumeInfo for PVC %s: %w", claimName, err)
 		}
 
-		if !vmopv1util.HasVMEntry(cvi, vm.Name) {
+		if vmopv1util.VMEntry(cvi, vm.Name) == nil {
 			// Append this VM to spec.vms and patch. CSI will react and update
 			// status (ownership transfer / green signal). Continue processing
 			// remaining volumes — other CVIs are independent.
 			patch := ctrlclient.MergeFrom(cvi.DeepCopy())
-			cvi.Spec.VMs = append(cvi.Spec.VMs, cnsv1alpha1.CsiVolumeInfoVMEntry{
+			cvi.Spec.VMs = append(cvi.Spec.VMs, cnsv1alpha1.VirtualMachineRef{
 				VMName:         vm.Name,
 				VMInstanceUUID: vm.Status.InstanceUUID,
 			})
@@ -197,7 +197,7 @@ func (r *Reconciler) reconcileOwnedVolumeDetach(
 	// there and then filtered by spec.pvcNamespace and spec.vms.
 	cviList := &cnsv1alpha1.CsiVolumeInfoList{}
 	if err := r.Client.List(ctx, cviList,
-		ctrlclient.InNamespace(pkgconst.CVISystemNamespace)); err != nil {
+		ctrlclient.InNamespace(cnsv1alpha1.CVINamespace)); err != nil {
 		return fmt.Errorf("failed to list CsiVolumeInfo objects: %w", err)
 	}
 
@@ -208,7 +208,7 @@ func (r *Reconciler) reconcileOwnedVolumeDetach(
 		if cvi.Spec.PVCNamespace != vm.Namespace {
 			continue
 		}
-		if !vmopv1util.HasVMEntry(cvi, vm.Name) {
+		if vmopv1util.VMEntry(cvi, vm.Name) == nil {
 			continue
 		}
 
@@ -370,7 +370,7 @@ func (r *Reconciler) reconcileOwnedVolumeDelete(ctx *pkgctx.VolumeContext) error
 	// is garbage-collected.
 	cviList := &cnsv1alpha1.CsiVolumeInfoList{}
 	if err := r.Client.List(ctx, cviList,
-		ctrlclient.InNamespace(pkgconst.CVISystemNamespace)); err != nil {
+		ctrlclient.InNamespace(cnsv1alpha1.CVINamespace)); err != nil {
 		return fmt.Errorf("failed to list CsiVolumeInfo objects during VM deletion: %w", err)
 	}
 
@@ -380,7 +380,7 @@ func (r *Reconciler) reconcileOwnedVolumeDelete(ctx *pkgctx.VolumeContext) error
 		if cvi.Spec.PVCNamespace != vm.Namespace {
 			continue
 		}
-		if !vmopv1util.HasVMEntry(cvi, vm.Name) {
+		if vmopv1util.VMEntry(cvi, vm.Name) == nil {
 			continue
 		}
 
@@ -403,7 +403,7 @@ func (r *Reconciler) reconcileOwnedVolumeDelete(ctx *pkgctx.VolumeContext) error
 }
 
 // removeVMEntry returns a new slice with the entry for vmName removed.
-func removeVMEntry(entries []cnsv1alpha1.CsiVolumeInfoVMEntry, vmName string) []cnsv1alpha1.CsiVolumeInfoVMEntry {
+func removeVMEntry(entries []cnsv1alpha1.VirtualMachineRef, vmName string) []cnsv1alpha1.VirtualMachineRef {
 	result := entries[:0]
 	for _, e := range entries {
 		if e.VMName != vmName {

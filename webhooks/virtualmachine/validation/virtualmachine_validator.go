@@ -3737,10 +3737,10 @@ func validateOwnedVolumeAttach(
 	}
 
 	// Construct the CsiVolumeInfo CR name and look it up.
-	cviName := pkgconst.CVINamePrefix + volumeID
+	cviName := cnsv1alpha1.CVINamePrefix + volumeID
 	cvi := &cnsv1alpha1.CsiVolumeInfo{}
 	if err := c.Get(ctx, ctrlclient.ObjectKey{
-		Namespace: pkgconst.CVISystemNamespace,
+		Namespace: cnsv1alpha1.CVINamespace,
 		Name:      cviName,
 	}, cvi); err != nil {
 		if apierrors.IsNotFound(err) {

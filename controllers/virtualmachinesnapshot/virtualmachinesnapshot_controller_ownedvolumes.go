@@ -14,7 +14,6 @@ import (
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
 	cnsv1alpha1 "github.com/vmware-tanzu/vm-operator/external/vsphere-csi-driver/api/v1alpha1"
 	backupapi "github.com/vmware-tanzu/vm-operator/pkg/backup/api"
-	pkgconst "github.com/vmware-tanzu/vm-operator/pkg/constants"
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
 	vmopv1util "github.com/vmware-tanzu/vm-operator/pkg/util/vmopv1"
 )
@@ -52,7 +51,7 @@ func (r *Reconciler) refreshCVIDiskPathsFromSnapshot(
 		// which is deterministic and avoids the PVC → PV → volumeHandle chain.
 		cvi := &cnsv1alpha1.CsiVolumeInfo{}
 		cviKey := ctrlclient.ObjectKey{
-			Namespace: pkgconst.CVISystemNamespace,
+			Namespace: cnsv1alpha1.CVINamespace,
 			Name:      vmopv1util.CVINameForVolumeID(disk.UUID),
 		}
 		if err := r.Client.Get(ctx, cviKey, cvi); err != nil {
@@ -128,7 +127,7 @@ func (r *Reconciler) evaluateCVIForDeletedSnapshot(
 	}
 
 	// If the CVI has no VM entry for this VM, nothing to clean up.
-	if !vmopv1util.HasVMEntry(cvi, vmSnapshot.Spec.VMName) {
+	if vmopv1util.VMEntry(cvi, vmSnapshot.Spec.VMName) == nil {
 		logger.V(5).Info("CVI has no VM entry, skipping")
 		return nil
 	}

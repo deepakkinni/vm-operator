@@ -23,7 +23,6 @@ import (
 	cnsv1alpha1 "github.com/vmware-tanzu/vm-operator/external/vsphere-csi-driver/api/v1alpha1"
 	"github.com/vmware-tanzu/vm-operator/pkg/builder"
 	pkgcfg "github.com/vmware-tanzu/vm-operator/pkg/config"
-	pkgconst "github.com/vmware-tanzu/vm-operator/pkg/constants"
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/constants"
 	"github.com/vmware-tanzu/vm-operator/webhooks/common"
@@ -148,11 +147,11 @@ func (v validator) isVMOwnedPVCDeleteDenied(ctx *pkgctx.WebhookRequestContext) (
 	}
 
 	volumeID := pv.Spec.CSI.VolumeHandle
-	cviName := pkgconst.CVINamePrefix + volumeID
+	cviName := cnsv1alpha1.CVINamePrefix + volumeID
 
 	cvi := &cnsv1alpha1.CsiVolumeInfo{}
 	if err := v.client.Get(ctx, ctrlclient.ObjectKey{
-		Namespace: pkgconst.CVISystemNamespace,
+		Namespace: cnsv1alpha1.CVINamespace,
 		Name:      cviName,
 	}, cvi); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -164,7 +163,7 @@ func (v validator) isVMOwnedPVCDeleteDenied(ctx *pkgctx.WebhookRequestContext) (
 		return false, ""
 	}
 
-	if cvi.Status.Ownership == cnsv1alpha1.OwnershipVMManaged {
+	if cvi.Status.Ownership == cnsv1alpha1.OwnershipStateVMManaged {
 		return true, fmt.Sprintf(vmManagedPVCDeleteDeniedFmt, pvcName)
 	}
 

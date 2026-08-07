@@ -268,14 +268,27 @@ const (
 	// for attach/detach operations.
 	VMOwnedVolumesAnnotation = "vmoperator.vmware.com/vm-owned-volumes"
 
-	// CVISystemNamespace is the namespace where CsiVolumeInfo CRs live.
-	CVISystemNamespace = "vmware-system-csi"
-
-	// CVINamePrefix is the prefix used to construct a CsiVolumeInfo CR name
-	// from the CNS volume ID. The full name is CVINamePrefix + volumeID.
-	CVINamePrefix = "cns-volume-"
-
 	// CVICleanupFinalizer is placed on VM-owned-volumes VMs to ensure CsiVolumeInfo
 	// entries referencing the VM are cleaned up before the VM CR is deleted.
 	CVICleanupFinalizer = "vmoperator.vmware.com/cvi-cleanup"
+
+	// MigrateToVMOwnedAnnotation is the explicit, user-set trigger for
+	// migrating a brownfield VM onto the VM-owned-volumes path (migration
+	// §4.2).
+	MigrateToVMOwnedAnnotation = "vmoperator.vmware.com/migrate-to-vm-owned"
+
+	// VMOwnedMigrationAnnotation records the in-progress/complete state of a
+	// VM's migration onto the VM-owned-volumes path, set on the VM's
+	// CnsNodeVMBatchAttachment (migration §6.3).
+	VMOwnedMigrationAnnotation = "cns.vmware.com/vm-owned-migration"
+
+	// VMOwnedMigrationInProgress is the VMOwnedMigrationAnnotation value while
+	// a VM's disks are being moved onto the CsiVolumeInfo path. CSI's BA
+	// controller returns early while it is present.
+	VMOwnedMigrationInProgress = "InProgress"
+
+	// VMOwnedMigrationComplete is the VMOwnedMigrationAnnotation value once
+	// every disk has been confirmed on the CsiVolumeInfo path and the BA has
+	// been retired.
+	VMOwnedMigrationComplete = "Complete"
 )

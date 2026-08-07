@@ -26,7 +26,7 @@ func HasVMOwnedVolumesAnnotation(vm *vmopv1.VirtualMachine) bool {
 // CVINameForVolumeID returns the deterministic CsiVolumeInfo CR name for the
 // volume identified by the given CNS volume ID.
 func CVINameForVolumeID(volumeID string) string {
-	return pkgconst.CVINamePrefix + volumeID
+	return cnsv1alpha1.CVINamePrefix + volumeID
 }
 
 // GetCVIForPVC resolves the CsiVolumeInfo for the given PVC by looking up the
@@ -69,7 +69,7 @@ func GetCVIForPVC(
 	// 4. Get CVI by name in the CSI system namespace.
 	cvi := &cnsv1alpha1.CsiVolumeInfo{}
 	if err := c.Get(ctx, ctrlclient.ObjectKey{
-		Namespace: pkgconst.CVISystemNamespace,
+		Namespace: cnsv1alpha1.CVINamespace,
 		Name:      CVINameForVolumeID(volumeID),
 	}, cvi); err != nil {
 		return nil, fmt.Errorf("failed to get CsiVolumeInfo for volume %s: %w", volumeID, err)
@@ -78,30 +78,59 @@ func GetCVIForPVC(
 	return cvi, nil
 }
 
+// DiskModeForVolume maps vm.spec.volumes[*].diskMode to the CsiVolumeInfo
+// DiskMode enum, treating an empty value as Persistent, matching the
+// vm.spec default (attach/detach §4.1.3).
+func DiskModeForVolume(vol vmopv1.VirtualMachineVolume) cnsv1alpha1.CVIDiskMode {
+	switch vol.DiskMode {
+	case vmopv1.VolumeDiskModeIndependentPersistent:
+		return cnsv1alpha1.CVIDiskModeIndependentPersistent
+	case vmopv1.VolumeDiskModeIndependentNonPersistent:
+		return cnsv1alpha1.CVIDiskModeIndependentNonPersistent
+	case vmopv1.VolumeDiskModeNonPersistent:
+		return cnsv1alpha1.CVIDiskModeNonPersistent
+	case vmopv1.VolumeDiskModePersistent, "":
+		return cnsv1alpha1.CVIDiskModePersistent
+	default:
+		return cnsv1alpha1.CVIDiskModePersistent
+	}
+}
+
+// IsDependentMode reports whether the given CsiVolumeInfo disk mode is the
+// dependent mode (ownership transfer via best-effort unregister). Every
+// other mode is independent: the FCD stays registered and CSIManaged.
+func IsDependentMode(dm cnsv1alpha1.CVIDiskMode) bool {
+	return dm == "" || dm == cnsv1alpha1.CVIDiskModePersistent
+}
+
+// IsFcdRetained reports whether the CsiVolumeInfo carries the fcd-retained
+// annotation: a VMManaged volume whose FCD could not be unregistered because
+// an in-place unregister was blocked (attach/detach §7.3 A.5).
+func IsFcdRetained(cvi *cnsv1alpha1.CsiVolumeInfo) bool {
+	return metav1.HasAnnotation(cvi.ObjectMeta, cnsv1alpha1.FcdRetainedAnnotation)
+}
+
 // IsGreenSignal reports whether the CsiVolumeInfo status has the green signal
 // that permits vm-operator to add the disk to the VM.
 // Green signal = status.ownership==VMManaged && status.phase==Succeeded
 // && status.observedGeneration >= metadata.generation.
+//
+// This must stay independent of fcd-retained: gating it on the annotation's
+// absence would deadlock every deferred volume, which is VMManaged and
+// Succeeded by design but never sheds the annotation (§7.3 A.5).
 func IsGreenSignal(cvi *cnsv1alpha1.CsiVolumeInfo) bool {
-	return cvi.Status.Ownership == cnsv1alpha1.OwnershipVMManaged &&
+	return cvi.Status.Ownership == cnsv1alpha1.OwnershipStateVMManaged &&
 		cvi.Status.Phase == cnsv1alpha1.PhaseSucceeded &&
 		cvi.Status.ObservedGeneration >= cvi.Generation
 }
 
-// HasVMEntry reports whether spec.vms contains an entry for the given vmName.
-func HasVMEntry(cvi *cnsv1alpha1.CsiVolumeInfo, vmName string) bool {
-	for _, entry := range cvi.Spec.VMs {
-		if entry.VMName == vmName {
-			return true
+// VMEntry returns the spec.vms entry for the given vmName, or nil if none
+// exists.
+func VMEntry(cvi *cnsv1alpha1.CsiVolumeInfo, vmName string) *cnsv1alpha1.VirtualMachineRef {
+	for i := range cvi.Spec.VMs {
+		if cvi.Spec.VMs[i].VMName == vmName {
+			return &cvi.Spec.VMs[i]
 		}
 	}
-	return false
-}
-
-// IsDependentPersistentMode reports whether the volume's disk mode requires
-// ownership transfer (only Persistent mode does).
-func IsDependentPersistentMode(vol vmopv1.VirtualMachineVolume) bool {
-	// Only VolumeDiskModePersistent (empty = default = Persistent) triggers the path.
-	dm := vol.DiskMode
-	return dm == "" || dm == vmopv1.VolumeDiskModePersistent
+	return nil
 }

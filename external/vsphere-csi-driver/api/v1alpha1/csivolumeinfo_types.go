@@ -9,53 +9,106 @@ import (
 )
 
 const (
-	// CsiVolumeInfoFinalizer is the finalizer placed on CsiVolumeInfo objects
-	// by the CSI driver to protect them from premature deletion.
-	CsiVolumeInfoFinalizer = "csi.vsphere.vmware.com/volume-protection"
+	// VolumeProtectionFinalizer prevents GC while ownership is VMManaged.
+	VolumeProtectionFinalizer = "csi.vsphere.vmware.com/volume-protection"
 
-	// CsiVolumeInfoNamePrefix is the prefix used to construct a CsiVolumeInfo
-	// CR name from the CNS volume ID. The full name is CsiVolumeInfoNamePrefix
-	// + volumeID.
-	CsiVolumeInfoNamePrefix = "cns-volume-"
+	// PVCVolumeProtectionFinalizer is written by CSI's CsiVolumeInfo controller
+	// onto the bound PVC while spec.vms is non-empty. It is the only thing
+	// preventing deletion of an attached PVC for an independent volume, since
+	// that CsiVolumeInfo never transitions to VMManaged and
+	// VolumeProtectionFinalizer above never applies to it. vm-operator does not
+	// write this finalizer and must not be surprised by its presence.
+	PVCVolumeProtectionFinalizer = "csi.vsphere.vmware.com/pvc-volume-protection"
 
-	// CsiVolumeInfoNamespace is the namespace where CsiVolumeInfo CRs live.
-	CsiVolumeInfoNamespace = "vmware-system-csi"
+	// CVINamespace is the namespace where CsiVolumeInfo CRs live.
+	CVINamespace = "vmware-system-csi"
+
+	// CVINamePrefix is the prefix used to construct a CsiVolumeInfo CR name
+	// from the CNS volume ID. The full name is CVINamePrefix + volumeID.
+	CVINamePrefix = "cvi-volume-"
+
+	// FcdRetainedAnnotation marks a VMManaged volume whose FCD was NOT
+	// unregistered because an in-place unregister was blocked. The FCD, its
+	// CNS DB row, and its FCD snapshots all still exist, so lock-down for such
+	// a volume must be enforced by consulting this annotation rather than by
+	// relying on CNS to return NotFound.
+	FcdRetainedAnnotation = "csi.vsphere.vmware.com/fcd-retained"
 )
 
-// CsiVolumeOwnership describes who currently manages a CNS volume.
-type CsiVolumeOwnership string
+// OwnershipState is the current ownership of the volume.
+type OwnershipState string
 
 const (
-	// OwnershipCSIManaged indicates the volume is managed by the CSI driver.
-	OwnershipCSIManaged CsiVolumeOwnership = "CSIManaged"
+	// OwnershipStateCSIManaged is the steady state when the volume is a
+	// registered FCD managed by CSI.
+	OwnershipStateCSIManaged OwnershipState = "CSIManaged"
 
-	// OwnershipVMManaged indicates the volume is managed by vm-operator.
-	OwnershipVMManaged CsiVolumeOwnership = "VMManaged"
+	// OwnershipStateVMManaged is the steady state when the disk is a plain
+	// VMDK managed by a greenfield VM.
+	OwnershipStateVMManaged OwnershipState = "VMManaged"
 )
 
-// CsiVolumePhase describes the current lifecycle phase of a CsiVolumeInfo.
-type CsiVolumePhase string
+// PhaseState represents the reconcile phase of a CsiVolumeInfo.
+type PhaseState string
 
 const (
-	// PhasePending indicates the volume operation is in progress.
-	PhasePending CsiVolumePhase = "Pending"
+	// PhasePending indicates the controller has not yet acted on the current
+	// spec generation.
+	PhasePending PhaseState = "Pending"
 
-	// PhaseSucceeded indicates the volume operation completed successfully.
-	PhaseSucceeded CsiVolumePhase = "Succeeded"
+	// PhaseSucceeded indicates the last reconcile completed successfully.
+	PhaseSucceeded PhaseState = "Succeeded"
 
-	// PhaseFailed indicates the volume operation failed.
-	PhaseFailed CsiVolumePhase = "Failed"
+	// PhaseFailed indicates the last reconcile encountered an error.
+	PhaseFailed PhaseState = "Failed"
 )
 
-// CsiVolumeInfoVMEntry records the relationship between a CNS volume and a
-// VirtualMachine. Its presence in spec.vms indicates an attach or
-// snapshot-retained relationship.
-type CsiVolumeInfoVMEntry struct {
-	// VMName is the name of the VirtualMachine object.
+// CVIDiskMode is the disk mode a VM attaches a volume in, mirroring
+// vmopv1.VolumeDiskMode. Named distinctly from this package's existing
+// DiskMode (CnsNodeVMBatchAttachment's lower-snake-case enum) because both
+// types live in this single mirrored package; CSI keeps them apart in
+// separate Go packages. The JSON wire values match CSI's DiskMode exactly.
+type CVIDiskMode string
+
+const (
+	// CVIDiskModePersistent is the dependent mode: CSI transfers ownership
+	// of the FCD to the VM via a best-effort unregister.
+	CVIDiskModePersistent CVIDiskMode = "Persistent"
+	// CVIDiskModeIndependentPersistent is an independent mode: the FCD stays
+	// registered and CSIManaged.
+	CVIDiskModeIndependentPersistent CVIDiskMode = "IndependentPersistent"
+	// CVIDiskModeIndependentNonPersistent is an independent mode: the FCD
+	// stays registered and CSIManaged.
+	CVIDiskModeIndependentNonPersistent CVIDiskMode = "IndependentNonPersistent"
+	// CVIDiskModeNonPersistent is treated like an independent mode for
+	// ownership purposes: the FCD stays registered and CSIManaged.
+	CVIDiskModeNonPersistent CVIDiskMode = "NonPersistent"
+)
+
+// VirtualMachineRef identifies a VM attached to the volume.
+type VirtualMachineRef struct {
+	// VMName is the VirtualMachine CR name.
 	VMName string `json:"vmName"`
 
-	// VMInstanceUUID is the instance UUID of the vSphere VM.
-	VMInstanceUUID string `json:"vmInstanceUUID"`
+	// VMInstanceUUID is the instance UUID of the VM.
+	// +optional
+	VMInstanceUUID string `json:"vmInstanceUUID,omitempty"`
+
+	// DiskMode is the disk mode this VM attaches the volume in. CSI keys the
+	// ownership-transfer decision on it: a Persistent (dependent) entry
+	// triggers the best-effort unregister, while an independent entry leaves
+	// the FCD registered and the volume CSIManaged. Written by vm-operator,
+	// mirroring vm.spec.volumes[*].diskMode. An empty value is treated as
+	// Persistent, matching the vm.spec default.
+	// +optional
+	DiskMode CVIDiskMode `json:"diskMode,omitempty"`
+
+	// VolumeName is vm.spec.volumes[*].name on that VM. vm-operator writes it
+	// so that a detach can correlate this entry to its vm.status.volumes
+	// entry — and therefore to the device slot — after the volume has
+	// already been removed from vm.spec.volumes. CSI does not read it.
+	// +optional
+	VolumeName string `json:"volumeName,omitempty"`
 }
 
 // CsiVolumeInfoSpec defines the desired state of CsiVolumeInfo.
@@ -64,13 +117,12 @@ type CsiVolumeInfoSpec struct {
 	// +required
 	VolumeID string `json:"volumeID"`
 
-	// PVCName is the name of the bound PersistentVolumeClaim. The JSON tag must
-	// be "pvcName" to match the CsiVolumeInfo CRD served by CSI.
+	// PVCName is the name of the bound PersistentVolumeClaim.
 	// +optional
 	PVCName string `json:"pvcName,omitempty"`
 
 	// PVCNamespace is the namespace of the bound PersistentVolumeClaim. The
-	// CsiVolumeInfo CR itself lives in CsiVolumeInfoNamespace.
+	// CsiVolumeInfo CR itself lives in CVINamespace.
 	// +optional
 	PVCNamespace string `json:"pvcNamespace,omitempty"`
 
@@ -79,34 +131,37 @@ type CsiVolumeInfoSpec struct {
 	PVName string `json:"pvName,omitempty"`
 
 	// DiskUUID is the disk UUID for the CNS volume. This field is
-	// informational and may drift from the authoritative value.
+	// informational and may drift from the authoritative value. Unset for
+	// an fcd-retained volume, since the capture that fills it never runs on
+	// that path.
 	// +optional
 	DiskUUID string `json:"diskUUID,omitempty"`
 
-	// DiskPath is the VMDK datastore path for the CNS volume. CSI writes this
-	// field at Unregister time; vm-operator refreshes it just-in-time before
-	// attaching.
+	// DiskPath is the VMDK datastore path for the CNS volume. CSI writes
+	// this field at Unregister time; vm-operator refreshes it just-in-time
+	// before attaching.
 	// +optional
 	DiskPath string `json:"diskPath,omitempty"`
 
-	// VMs lists the VirtualMachine objects that have a relationship with this
-	// volume. vm-operator is the sole writer of this field. The presence of an
-	// entry indicates an attached or snapshot-retained relationship.
+	// VMs lists the VirtualMachine objects that have a relationship with
+	// this volume. vm-operator is the sole writer of this field. The
+	// presence of an entry indicates an attached or snapshot-retained
+	// relationship.
 	// +optional
 	// +listType=map
 	// +listMapKey=vmName
-	VMs []CsiVolumeInfoVMEntry `json:"vms,omitempty"`
+	VMs []VirtualMachineRef `json:"vms,omitempty"`
 }
 
 // CsiVolumeInfoStatus defines the observed state of CsiVolumeInfo.
 type CsiVolumeInfoStatus struct {
 	// Ownership indicates who currently manages this volume.
 	// +optional
-	Ownership CsiVolumeOwnership `json:"ownership,omitempty"`
+	Ownership OwnershipState `json:"ownership,omitempty"`
 
 	// Phase is the current lifecycle phase of the volume.
 	// +optional
-	Phase CsiVolumePhase `json:"phase,omitempty"`
+	Phase PhaseState `json:"phase,omitempty"`
 
 	// ObservedGeneration is the generation of the spec that was last
 	// processed by the controller.

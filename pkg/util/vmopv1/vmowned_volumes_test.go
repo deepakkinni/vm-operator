@@ -57,20 +57,20 @@ var _ = DescribeTable("CVINameForVolumeID",
 	},
 	Entry("returns prefixed volume ID",
 		"abc-123",
-		"cns-volume-abc-123",
+		"cvi-volume-abc-123",
 	),
 	Entry("returns prefix with empty volume ID",
 		"",
-		"cns-volume-",
+		"cvi-volume-",
 	),
 	Entry("returns correct prefix for a UUID-like ID",
 		"6b86b273-ff34-febe-9af9-d89cde3b1234",
-		"cns-volume-6b86b273-ff34-febe-9af9-d89cde3b1234",
+		"cvi-volume-6b86b273-ff34-febe-9af9-d89cde3b1234",
 	),
 )
 
 var _ = DescribeTable("IsGreenSignal",
-	func(ownership cnsv1alpha1.CsiVolumeOwnership, phase cnsv1alpha1.CsiVolumePhase, generation int64, observedGeneration int64, expected bool) {
+	func(ownership cnsv1alpha1.OwnershipState, phase cnsv1alpha1.PhaseState, generation int64, observedGeneration int64, expected bool) {
 		cvi := &cnsv1alpha1.CsiVolumeInfo{
 			ObjectMeta: metav1.ObjectMeta{
 				Generation: generation,
@@ -84,49 +84,49 @@ var _ = DescribeTable("IsGreenSignal",
 		Ω(vmopv1util.IsGreenSignal(cvi)).Should(Equal(expected))
 	},
 	Entry("returns true when all green conditions are met",
-		cnsv1alpha1.OwnershipVMManaged,
+		cnsv1alpha1.OwnershipStateVMManaged,
 		cnsv1alpha1.PhaseSucceeded,
 		int64(1),
 		int64(1),
 		true,
 	),
 	Entry("returns true when observedGeneration exceeds generation",
-		cnsv1alpha1.OwnershipVMManaged,
+		cnsv1alpha1.OwnershipStateVMManaged,
 		cnsv1alpha1.PhaseSucceeded,
 		int64(1),
 		int64(2),
 		true,
 	),
 	Entry("returns false when ownership is CSIManaged",
-		cnsv1alpha1.OwnershipCSIManaged,
+		cnsv1alpha1.OwnershipStateCSIManaged,
 		cnsv1alpha1.PhaseSucceeded,
 		int64(1),
 		int64(1),
 		false,
 	),
 	Entry("returns false when ownership is empty",
-		cnsv1alpha1.CsiVolumeOwnership(""),
+		cnsv1alpha1.OwnershipState(""),
 		cnsv1alpha1.PhaseSucceeded,
 		int64(1),
 		int64(1),
 		false,
 	),
 	Entry("returns false when phase is Pending",
-		cnsv1alpha1.OwnershipVMManaged,
+		cnsv1alpha1.OwnershipStateVMManaged,
 		cnsv1alpha1.PhasePending,
 		int64(1),
 		int64(1),
 		false,
 	),
 	Entry("returns false when phase is Failed",
-		cnsv1alpha1.OwnershipVMManaged,
+		cnsv1alpha1.OwnershipStateVMManaged,
 		cnsv1alpha1.PhaseFailed,
 		int64(1),
 		int64(1),
 		false,
 	),
 	Entry("returns false when observedGeneration is less than generation",
-		cnsv1alpha1.OwnershipVMManaged,
+		cnsv1alpha1.OwnershipStateVMManaged,
 		cnsv1alpha1.PhaseSucceeded,
 		int64(3),
 		int64(2),
@@ -134,24 +134,24 @@ var _ = DescribeTable("IsGreenSignal",
 	),
 )
 
-var _ = DescribeTable("HasVMEntry",
-	func(vms []cnsv1alpha1.CsiVolumeInfoVMEntry, vmName string, expected bool) {
+var _ = DescribeTable("VMEntry",
+	func(vms []cnsv1alpha1.VirtualMachineRef, vmName string, expected bool) {
 		cvi := &cnsv1alpha1.CsiVolumeInfo{
 			Spec: cnsv1alpha1.CsiVolumeInfoSpec{
 				VMs: vms,
 			},
 		}
-		Ω(vmopv1util.HasVMEntry(cvi, vmName)).Should(Equal(expected))
+		Ω(vmopv1util.VMEntry(cvi, vmName) != nil).Should(Equal(expected))
 	},
 	Entry("returns true when spec.vms contains a matching entry",
-		[]cnsv1alpha1.CsiVolumeInfoVMEntry{
+		[]cnsv1alpha1.VirtualMachineRef{
 			{VMName: "my-vm"},
 		},
 		"my-vm",
 		true,
 	),
 	Entry("returns true when spec.vms contains matching entry among multiple",
-		[]cnsv1alpha1.CsiVolumeInfoVMEntry{
+		[]cnsv1alpha1.VirtualMachineRef{
 			{VMName: "other-vm"},
 			{VMName: "my-vm"},
 		},
@@ -159,7 +159,7 @@ var _ = DescribeTable("HasVMEntry",
 		true,
 	),
 	Entry("returns false when spec.vms is empty",
-		[]cnsv1alpha1.CsiVolumeInfoVMEntry{},
+		[]cnsv1alpha1.VirtualMachineRef{},
 		"my-vm",
 		false,
 	),
@@ -169,7 +169,7 @@ var _ = DescribeTable("HasVMEntry",
 		false,
 	),
 	Entry("returns false when no entry matches",
-		[]cnsv1alpha1.CsiVolumeInfoVMEntry{
+		[]cnsv1alpha1.VirtualMachineRef{
 			{VMName: "other-vm"},
 			{VMName: "another-vm"},
 		},
@@ -178,12 +178,12 @@ var _ = DescribeTable("HasVMEntry",
 	),
 )
 
-var _ = DescribeTable("IsDependentPersistentMode",
+var _ = DescribeTable("DiskModeForVolume / IsDependentMode",
 	func(diskMode vmopv1.VolumeDiskMode, expected bool) {
 		vol := vmopv1.VirtualMachineVolume{
 			DiskMode: diskMode,
 		}
-		Ω(vmopv1util.IsDependentPersistentMode(vol)).Should(Equal(expected))
+		Ω(vmopv1util.IsDependentMode(vmopv1util.DiskModeForVolume(vol))).Should(Equal(expected))
 	},
 	Entry("returns true for empty diskMode (default persistent)",
 		vmopv1.VolumeDiskMode(""),
@@ -254,7 +254,7 @@ var _ = Describe("GetCVIForPVC", func() {
 		return &cnsv1alpha1.CsiVolumeInfo{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      vmopv1util.CVINameForVolumeID(volumeID),
-				Namespace: pkgconst.CVISystemNamespace,
+				Namespace: cnsv1alpha1.CVINamespace,
 			},
 		}
 	}

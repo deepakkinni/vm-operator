@@ -140,14 +140,14 @@ var _ = Describe(
 			cvi := &cnsv1alpha1.CsiVolumeInfo{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      vmopv1util.CVINameForVolumeID(volumeID),
-					Namespace: pkgconst.CVISystemNamespace,
+					Namespace: cnsv1alpha1.CVINamespace,
 				},
 				Spec: cnsv1alpha1.CsiVolumeInfoSpec{
 					VolumeID: volumeID,
 					DiskPath: "/vmfs/volumes/datastore1/disk.vmdk",
 				},
 				Status: cnsv1alpha1.CsiVolumeInfoStatus{
-					Ownership:          cnsv1alpha1.OwnershipVMManaged,
+					Ownership:          cnsv1alpha1.OwnershipStateVMManaged,
 					Phase:              cnsv1alpha1.PhaseSucceeded,
 					ObservedGeneration: 0,
 				},
@@ -260,7 +260,7 @@ var _ = Describe(
 							cvi := &cnsv1alpha1.CsiVolumeInfo{}
 							Expect(ctx.Client.Get(ctx, client.ObjectKey{
 								Name:      vmopv1util.CVINameForVolumeID(detachVolID),
-								Namespace: pkgconst.CVISystemNamespace,
+								Namespace: cnsv1alpha1.CVINamespace,
 							}, cvi)).To(Succeed())
 							return cvi
 						}
@@ -270,19 +270,19 @@ var _ = Describe(
 							cvi := &cnsv1alpha1.CsiVolumeInfo{
 								ObjectMeta: metav1.ObjectMeta{
 									Name:      vmopv1util.CVINameForVolumeID(detachVolID),
-									Namespace: pkgconst.CVISystemNamespace,
+									Namespace: cnsv1alpha1.CVINamespace,
 								},
 								Spec: cnsv1alpha1.CsiVolumeInfoSpec{
 									VolumeID:     detachVolID,
 									PVCName:      detachPVC,
 									PVCNamespace: ns,
 									DiskUUID:     "disk-uuid-detach",
-									VMs: []cnsv1alpha1.CsiVolumeInfoVMEntry{
+									VMs: []cnsv1alpha1.VirtualMachineRef{
 										{VMName: vmName},
 									},
 								},
 								Status: cnsv1alpha1.CsiVolumeInfoStatus{
-									Ownership: cnsv1alpha1.OwnershipVMManaged,
+									Ownership: cnsv1alpha1.OwnershipStateVMManaged,
 									Phase:     cnsv1alpha1.PhaseSucceeded,
 								},
 							}
@@ -300,7 +300,7 @@ var _ = Describe(
 							It("keeps the VM entry in the CVI (no premature re-register)", func() {
 								err := reconciler.ReconcileNormal(volCtx)
 								Expect(err).ToNot(HaveOccurred())
-								Expect(vmopv1util.HasVMEntry(getCVI(), vmName)).To(BeTrue(),
+								Expect(vmopv1util.VMEntry(getCVI(), vmName) != nil).To(BeTrue(),
 									"VM entry must persist while a snapshot retains the disk")
 							})
 						})
@@ -311,7 +311,7 @@ var _ = Describe(
 							It("removes the VM entry from the CVI", func() {
 								err := reconciler.ReconcileNormal(volCtx)
 								Expect(err).ToNot(HaveOccurred())
-								Expect(vmopv1util.HasVMEntry(getCVI(), vmName)).To(BeFalse(),
+								Expect(vmopv1util.VMEntry(getCVI(), vmName) != nil).To(BeFalse(),
 									"VM entry must be removed when nothing retains the disk")
 							})
 						})
@@ -376,7 +376,7 @@ var _ = Describe(
 							pvc, pv, cvi := buildPVCWithCVI(pvcName, pvName, volID)
 							// Pre-set the VM entry so the reconciler skips the patch
 							// step and proceeds directly to attach.
-							cvi.Spec.VMs = []cnsv1alpha1.CsiVolumeInfoVMEntry{
+							cvi.Spec.VMs = []cnsv1alpha1.VirtualMachineRef{
 								{VMName: vmName},
 							}
 							cvi.Spec.DiskUUID = "disk-uuid-abc"
@@ -508,17 +508,17 @@ var _ = Describe(
 							cvi1 := &cnsv1alpha1.CsiVolumeInfo{}
 							Expect(ctx.Client.Get(ctx, client.ObjectKey{
 								Name:      vmopv1util.CVINameForVolumeID(volID),
-								Namespace: pkgconst.CVISystemNamespace,
+								Namespace: cnsv1alpha1.CVINamespace,
 							}, cvi1)).To(Succeed())
-							Expect(vmopv1util.HasVMEntry(cvi1, vm.Name)).To(BeTrue(),
+							Expect(vmopv1util.VMEntry(cvi1, vm.Name) != nil).To(BeTrue(),
 								"CVI for vol-1 should have VM entry")
 
 							cvi2 := &cnsv1alpha1.CsiVolumeInfo{}
 							Expect(ctx.Client.Get(ctx, client.ObjectKey{
 								Name:      vmopv1util.CVINameForVolumeID(volID2),
-								Namespace: pkgconst.CVISystemNamespace,
+								Namespace: cnsv1alpha1.CVINamespace,
 							}, cvi2)).To(Succeed())
-							Expect(vmopv1util.HasVMEntry(cvi2, vm.Name)).To(BeTrue(),
+							Expect(vmopv1util.VMEntry(cvi2, vm.Name) != nil).To(BeTrue(),
 								"CVI for vol-2 should have VM entry")
 						})
 					})
@@ -534,9 +534,9 @@ var _ = Describe(
 							pvc1, pv1, cvi1 := buildPVCWithCVI(pvcName, pvName, volID)
 							pvc2, pv2, cvi2 := buildPVCWithCVI(pvcName2, pvName2, volID2)
 							// Pre-set VM entries and distinct DiskUUIDs on both CVIs.
-							cvi1.Spec.VMs = []cnsv1alpha1.CsiVolumeInfoVMEntry{{VMName: vm.Name}}
+							cvi1.Spec.VMs = []cnsv1alpha1.VirtualMachineRef{{VMName: vm.Name}}
 							cvi1.Spec.DiskUUID = "disk-uuid-111"
-							cvi2.Spec.VMs = []cnsv1alpha1.CsiVolumeInfoVMEntry{{VMName: vm.Name}}
+							cvi2.Spec.VMs = []cnsv1alpha1.VirtualMachineRef{{VMName: vm.Name}}
 							cvi2.Spec.DiskUUID = "disk-uuid-222"
 							initObjects = append(initObjects, pvc1, pv1, cvi1, pvc2, pv2, cvi2)
 
@@ -595,7 +595,7 @@ var _ = Describe(
 							pvc2, pv2, cvi2 := buildPVCWithCVI(pvcName2, pvName2, volID2)
 							// vol-1: no VM entry (needs patching, not yet green).
 							// vol-2: VM entry present, green signal already set.
-							cvi2.Spec.VMs = []cnsv1alpha1.CsiVolumeInfoVMEntry{{VMName: vm.Name}}
+							cvi2.Spec.VMs = []cnsv1alpha1.VirtualMachineRef{{VMName: vm.Name}}
 							cvi2.Spec.DiskUUID = "disk-uuid-222"
 							initObjects = append(initObjects, pvc1, pv1, cvi1, pvc2, pv2, cvi2)
 
@@ -641,9 +641,9 @@ var _ = Describe(
 							cvi1 := &cnsv1alpha1.CsiVolumeInfo{}
 							Expect(ctx.Client.Get(ctx, client.ObjectKey{
 								Name:      vmopv1util.CVINameForVolumeID(volID),
-								Namespace: pkgconst.CVISystemNamespace,
+								Namespace: cnsv1alpha1.CVINamespace,
 							}, cvi1)).To(Succeed())
-							Expect(vmopv1util.HasVMEntry(cvi1, vm.Name)).To(BeTrue(),
+							Expect(vmopv1util.VMEntry(cvi1, vm.Name) != nil).To(BeTrue(),
 								"CVI for vol-1 should have VM entry after patch")
 						})
 					})
