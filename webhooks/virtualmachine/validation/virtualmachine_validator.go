@@ -155,7 +155,6 @@ var (
 		"vnet":                        true,
 		"wakeonpcktrcv":               true,
 	}
-
 )
 
 // +kubebuilder:webhook:verbs=create;update,path=/default-validate-vmoperator-vmware-com-v1alpha6-virtualmachine,mutating=false,failurePolicy=fail,groups=vmoperator.vmware.com,resources=virtualmachines,versions=v1alpha6,name=default.validating.virtualmachine.v1alpha6.vmoperator.vmware.com,sideEffects=None,admissionReviewVersions=v1;v1beta1
@@ -1614,14 +1613,16 @@ func (v validator) validateVolumes(
 				vol,
 				volPath)...)
 
-		// For UPDATE requests only: validate that newly-added PVC volumes with
-		// Persistent diskMode are safe to attach on a vm-owned VM.
+		// For UPDATE requests only: validate that a newly-added PVC volume is
+		// safe to attach on a vm-owned VM. This applies to every disk mode
+		// (attach/detach §4.1.5) — the guard keys on spec.vms and is
+		// deliberately independent of status.ownership, which is what closes
+		// the race between A.2 and A.4 for every mode, not just Persistent.
 		if oldVM != nil &&
 			oldVolumesMap[vol.Name] == nil &&
 			pkgcfg.FromContext(ctx).Features.VMOwnedVolumes &&
 			metav1.HasAnnotation(vm.ObjectMeta, pkgconst.VMOwnedVolumesAnnotation) &&
-			vol.PersistentVolumeClaim != nil &&
-			(vol.DiskMode == "" || vol.DiskMode == vmopv1.VolumeDiskModePersistent) {
+			vol.PersistentVolumeClaim != nil {
 
 			allErrs = append(allErrs,
 				validateOwnedVolumeAttach(ctx, v.client, vm, vol, volPath)...)
@@ -2676,6 +2677,16 @@ func (v validator) validateAnnotation(ctx *pkgctx.WebhookRequestContext, vm, old
 		allErrs = append(allErrs, field.Forbidden(annotationPath.Key(vmopv1.ImportedVMAnnotation), modifyAnnotationNotAllowedForNonAdmin))
 	}
 
+	// Immutable once set — never removed except by migration (attach/detach
+	// §2.2). Scoped to the transition, not a principal: only a change to an
+	// already-set value is forbidden, so the absent → "true" transition the
+	// mutation webhook performs on create (and a future migration
+	// controller would perform on an existing VM) is unaffected.
+	if oldVM.Annotations[pkgconst.VMOwnedVolumesAnnotation] != "" &&
+		vm.Annotations[pkgconst.VMOwnedVolumesAnnotation] != oldVM.Annotations[pkgconst.VMOwnedVolumesAnnotation] {
+		allErrs = append(allErrs, field.Forbidden(annotationPath.Key(pkgconst.VMOwnedVolumesAnnotation), modifyAnnotationNotAllowedForNonAdmin))
+	}
+
 	for k := range anno2extraconfig.AnnotationsToExtraConfigKeys {
 		if vm.Annotations[k] != oldVM.Annotations[k] {
 			allErrs = append(allErrs, field.Forbidden(annotationPath.Key(k), modifyAnnotationNotAllowedForNonAdmin))
@@ -3208,7 +3219,7 @@ func (v validator) validateBootOrder(
 }
 
 func (v validator) validateSnapshot(
-	_ *pkgctx.WebhookRequestContext,
+	ctx *pkgctx.WebhookRequestContext,
 	vm *vmopv1.VirtualMachine,
 	oldVM *vmopv1.VirtualMachine) field.ErrorList {
 
@@ -3235,7 +3246,8 @@ func (v validator) validateSnapshot(
 	}
 
 	// If a revert is in progress, we don't allow a new revert.
-	if oldVM != nil && oldVM.Spec.CurrentSnapshotName != "" {
+	revertAlreadyInProgress := oldVM != nil && oldVM.Spec.CurrentSnapshotName != ""
+	if revertAlreadyInProgress {
 		if oldVM.Spec.CurrentSnapshotName != vm.Spec.CurrentSnapshotName {
 			allErrs = append(allErrs, field.Forbidden(snapshotPath, "a snapshot revert is already in progress"))
 		}
@@ -3244,6 +3256,32 @@ func (v validator) validateSnapshot(
 	// Check if the VM is a VKS node and prevent snapshot revert
 	if kubeutil.HasCAPILabels(vm.Labels) {
 		allErrs = append(allErrs, field.Forbidden(snapshotPath, "snapshot revert is not allowed for VKS nodes"))
+	}
+
+	// Reject a revert whose target snapshot is being deleted (attach/detach
+	// §11.1): reverting to a snapshot mid-deletion races the delete's own
+	// disk-registration cleanup. Only checked for a newly-requested revert,
+	// not a repeat of one already in progress. A read error other than
+	// NotFound admits rather than rejects — a transient failure here must
+	// not halt every edit to this VM.
+	if !revertAlreadyInProgress {
+		snap := &vmopv1.VirtualMachineSnapshot{}
+		err := v.client.Get(ctx, ctrlclient.ObjectKey{
+			Namespace: vm.Namespace,
+			Name:      vm.Spec.CurrentSnapshotName,
+		}, snap)
+		switch {
+		case err == nil:
+			if !snap.DeletionTimestamp.IsZero() {
+				allErrs = append(allErrs, field.Forbidden(snapshotPath,
+					"cannot revert to a snapshot that is being deleted"))
+			}
+		case apierrors.IsNotFound(err):
+			// Some other validation surfaces a missing snapshot; not this one.
+		default:
+			pkglog.FromContextOrDefault(ctx).Error(err, "failed to get VirtualMachineSnapshot for revert-target check",
+				"snapshot", vm.Spec.CurrentSnapshotName)
+		}
 	}
 
 	return allErrs
@@ -3661,7 +3699,6 @@ func isFirstClassVMAdvancedProperty(key string) bool {
 	return ok
 }
 
-
 func isSystemReservedNetworkDeviceProperty(key string) bool {
 	return systemReservedNetworkDeviceProperties[key]
 }
@@ -3749,6 +3786,24 @@ func validateOwnedVolumeAttach(
 		}
 		allErrs = append(allErrs, field.InternalError(fieldPath, err))
 		return allErrs
+	}
+
+	// A volume has one physical form; mixed modes across VMs are unsupported
+	// (§4.1.3, §16 Q15). This check applies regardless of access mode — an
+	// RWM volume may be attached to several VMs, but not in different modes.
+	newDiskMode := vmopv1util.DiskModeForVolume(vol)
+	for _, entry := range cvi.Spec.VMs {
+		if entry.VMName == vm.Name {
+			continue
+		}
+		if vmopv1util.NormalizeDiskMode(entry.DiskMode) != newDiskMode {
+			allErrs = append(allErrs, field.Invalid(
+				fieldPath,
+				vol.Name,
+				fmt.Sprintf("PVC is already attached to VM %q in a different disk mode", entry.VMName),
+			))
+			return allErrs
+		}
 	}
 
 	// RWM volumes in dependent-persistent mode may be attached to multiple VMs

@@ -31,9 +31,10 @@ import (
 const (
 	webHookName = "default"
 
-	operationNotAllowedOnPVC    = "%s operation on PVC with instance storage label is not allowed"
-	addingISLabelNotAllowed     = "adding instance storage label is not allowed"
-	vmManagedPVCDeleteDeniedFmt = "cannot delete PVC %s: volume is VM-managed; detach from all VMs and delete retaining snapshots first"
+	operationNotAllowedOnPVC     = "%s operation on PVC with instance storage label is not allowed"
+	addingISLabelNotAllowed      = "adding instance storage label is not allowed"
+	vmManagedPVCDeleteDeniedFmt  = "cannot delete PVC %s: volume is VM-managed; detach from all VMs and delete retaining snapshots first"
+	vmAttachedPVCDeleteDeniedFmt = "cannot delete PVC %s: volume is attached to a VM-owned VM; detach it first"
 )
 
 // +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get
@@ -165,6 +166,14 @@ func (v validator) isVMOwnedPVCDeleteDenied(ctx *pkgctx.WebhookRequestContext) (
 
 	if cvi.Status.Ownership == cnsv1alpha1.OwnershipStateVMManaged {
 		return true, fmt.Sprintf(vmManagedPVCDeleteDeniedFmt, pvcName)
+	}
+
+	// An independent volume never transitions to VMManaged — it stays
+	// CSIManaged for as long as it is attached (attach/detach §13.2.1) — so
+	// ownership alone misses it. spec.vms non-empty is the general "attached
+	// to a VM-owned VM" signal that covers every mode.
+	if len(cvi.Spec.VMs) > 0 {
+		return true, fmt.Sprintf(vmAttachedPVCDeleteDeniedFmt, pvcName)
 	}
 
 	return false, ""
