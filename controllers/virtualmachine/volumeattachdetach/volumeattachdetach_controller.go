@@ -81,6 +81,25 @@ func AddToManager(ctx *pkgctx.ControllerManagerContext, mgr manager.Manager) err
 		return err
 	}
 
+	// Set up field indexes for CsiVolumeInfo by spec.vms[*].vmInstanceUUID and
+	// spec.vms[*].vmName so a VM-owned VM's detach and delete paths can find
+	// every CsiVolumeInfo that references it without an unbounded scan of
+	// vmware-system-csi (V6; implementation-rules §7).
+	if err := mgr.GetFieldIndexer().IndexField(
+		ctx,
+		&cnsv1alpha1.CsiVolumeInfo{},
+		vmopv1util.CVIVMInstanceUUIDIndexKey,
+		vmopv1util.IndexCVIByVMInstanceUUID); err != nil {
+		return err
+	}
+	if err := mgr.GetFieldIndexer().IndexField(
+		ctx,
+		&cnsv1alpha1.CsiVolumeInfo{},
+		vmopv1util.CVIVMNameIndexKey,
+		vmopv1util.IndexCVIByVMName); err != nil {
+		return err
+	}
+
 	// Set up field index for VirtualMachine by ClaimName to efficiently query VMs
 	// referencing a PVC.
 	if err := mgr.GetFieldIndexer().IndexField(
@@ -231,7 +250,7 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=cns.vmware.com,resources=cnsnodevmbatchattachments,verbs=create;delete;get;list;watch;patch;update
 // +kubebuilder:rbac:groups=cns.vmware.com,resources=cnsnodevmbatchattachments/status,verbs=get;list
 // +kubebuilder:rbac:groups=cns.vmware.com,resources=cnsnodevmattachments,verbs=delete;get;list;watch
-// +kubebuilder:rbac:groups=cns.vmware.com,resources=csivolumeinfos,verbs=get;list;watch;patch;update
+// +kubebuilder:rbac:groups=cns.vmware.com,resources=csivolumeinfos,verbs=create;get;list;watch;patch;update
 
 // Reconcile reconciles a VirtualMachine object and processes the volumes for batch attachment.
 func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (_ ctrl.Result, reterr error) {

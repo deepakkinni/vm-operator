@@ -80,6 +80,14 @@ var _ = Describe(
 						attachment := rawObj.(*cnsv1alpha1.CnsNodeVmAttachment)
 						return []string{attachment.Spec.NodeUUID}
 					}).
+				WithIndex(
+					&cnsv1alpha1.CsiVolumeInfo{},
+					vmopv1util.CVIVMInstanceUUIDIndexKey,
+					vmopv1util.IndexCVIByVMInstanceUUID).
+				WithIndex(
+					&cnsv1alpha1.CsiVolumeInfo{},
+					vmopv1util.CVIVMNameIndexKey,
+					vmopv1util.IndexCVIByVMName).
 				Build()
 
 			reconciler = volumeattachdetach.NewReconciler(
@@ -433,7 +441,7 @@ var _ = Describe(
 						})
 					})
 
-					When("VM has a dependent-persistent volume but no CVI exists (brownfield PVC)", func() {
+					When("VM has a dependent-persistent volume but no CVI exists yet", func() {
 						BeforeEach(func() {
 							pvc := &corev1.PersistentVolumeClaim{
 								ObjectMeta: metav1.ObjectMeta{
@@ -456,7 +464,8 @@ var _ = Describe(
 									},
 								},
 							}
-							// No CVI: GetCVIForPVC returns not-found → vm-owned-volumes skips.
+							// No CVI: EnsureCVIForPVC creates it (V6; a missing CVI on a
+							// VM-owned VM is an anomaly to repair, not brownfield to skip).
 							initObjects = append(initObjects, pvc, pv)
 
 							vm.Spec.Volumes = []vmopv1.VirtualMachineVolume{
@@ -473,10 +482,20 @@ var _ = Describe(
 							}
 						})
 
-						It("skips the volume and returns nil", func() {
+						It("creates the CVI, writes the VM entry, and requeues", func() {
 							err := reconciler.ReconcileNormal(volCtx)
-							Expect(err).ToNot(HaveOccurred())
+
+							var requeue pkgerr.RequeueError
+							Expect(errors.As(err, &requeue)).To(BeTrue(),
+								"expected a RequeueError, got: %v", err)
 							Expect(vm.Status.Volumes).To(BeEmpty())
+
+							cvi := &cnsv1alpha1.CsiVolumeInfo{}
+							Expect(ctx.Client.Get(ctx, client.ObjectKey{
+								Name:      vmopv1util.CVINameForVolumeID(volID),
+								Namespace: cnsv1alpha1.CVINamespace,
+							}, cvi)).To(Succeed())
+							Expect(vmopv1util.VMEntry(cvi, vm.Name) != nil).To(BeTrue())
 						})
 					})
 

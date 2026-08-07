@@ -185,7 +185,7 @@ type CsiVolumeInfoStatus struct {
 // +k8s:openapi-gen=true
 // +kubebuilder:subresource:status
 // +kubebuilder:object:root=true
-// +kubebuilder:resource:shortName=cvi
+// +kubebuilder:resource:shortName=cvi,path=csivolumeinfos,singular=csivolumeinfo
 
 // CsiVolumeInfo is the Schema for the csivolumeinfolist API. It tracks
 // per-volume ownership between the CSI driver and vm-operator. vm-operator

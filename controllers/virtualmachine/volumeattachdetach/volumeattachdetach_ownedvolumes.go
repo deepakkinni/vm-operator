@@ -96,15 +96,19 @@ func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error
 
 		claimName := plan.ClaimName
 
-		cvi, err := vmopv1util.GetCVIForPVC(ctx, r.Client, vm.Namespace, claimName)
+		// A missing CsiVolumeInfo on a VM-owned VM is an anomaly to repair,
+		// not a brownfield PVC to skip (attach/detach §4.1.2, §13.1) — so
+		// this creates it rather than looking it up read-only. Only an
+		// unresolvable PVC or PV (not yet bound, or genuinely orphaned) is
+		// skipped.
+		cvi, err := vmopv1util.EnsureCVIForPVC(ctx, r.Client, vm.Namespace, claimName)
 		if err != nil {
 			if apierrors.IsNotFound(err) {
-				// Brownfield PVC without a CsiVolumeInfo — skip; legacy path handles it.
-				ctx.Logger.Info("No CsiVolumeInfo for PVC — skipping vm-owned volumes path",
+				ctx.Logger.Info("PVC or PV not resolvable — skipping vm-owned volumes path for now",
 					"pvc", claimName)
 				continue
 			}
-			return fmt.Errorf("failed to get CsiVolumeInfo for PVC %s: %w", claimName, err)
+			return fmt.Errorf("failed to ensure CsiVolumeInfo for PVC %s: %w", claimName, err)
 		}
 
 		entry := vmopv1util.VMEntry(cvi, vm.Name)
@@ -206,22 +210,17 @@ func (r *Reconciler) reconcileOwnedVolumeDetach(
 
 	vm := ctx.VM
 
-	// List all CsiVolumeInfo CRs in the system namespace that have an entry for
-	// this VM. The CVI lives in the CSI system namespace, so the list is scoped
-	// there and then filtered by spec.pvcNamespace and spec.vms.
-	cviList := &cnsv1alpha1.CsiVolumeInfoList{}
-	if err := r.Client.List(ctx, cviList,
-		ctrlclient.InNamespace(cnsv1alpha1.CVINamespace)); err != nil {
-		return fmt.Errorf("failed to list CsiVolumeInfo objects: %w", err)
+	// Find every CsiVolumeInfo that references this VM via the indexed
+	// lookup — bounded by the VM's own CVI population, not a scan of every
+	// CVI in vmware-system-csi (V6; implementation-rules §7).
+	cvis, err := vmopv1util.ListCVIsForVM(ctx, r.Client, vm)
+	if err != nil {
+		return fmt.Errorf("failed to list CsiVolumeInfo objects for VM: %w", err)
 	}
 
-	for i := range cviList.Items {
-		cvi := &cviList.Items[i]
+	for i := range cvis {
+		cvi := &cvis[i]
 
-		// Only consider CVIs for PVCs in this VM's namespace that reference this VM.
-		if cvi.Spec.PVCNamespace != vm.Namespace {
-			continue
-		}
 		if vmopv1util.VMEntry(cvi, vm.Name) == nil {
 			continue
 		}
@@ -377,23 +376,21 @@ func (r *Reconciler) reconcileOwnedVolumeDelete(ctx *pkgctx.VolumeContext) error
 
 	ctx.Logger.Info("Reconciling VM-owned-volumes VM deletion: cleaning up CsiVolumeInfo entries")
 
-	// Iterate ALL CsiVolumeInfo CRs that reference this VM (per spec §13.5.2),
+	// Find every CsiVolumeInfo that references this VM (per spec §13.5.2),
 	// not just those for volumes still in vm.spec.volumes. A CVI entry may
 	// linger for a volume already removed from spec (e.g. snapshot-retained or
 	// an in-flight detach), and those must also be cleaned up before the VM CR
-	// is garbage-collected.
-	cviList := &cnsv1alpha1.CsiVolumeInfoList{}
-	if err := r.Client.List(ctx, cviList,
-		ctrlclient.InNamespace(cnsv1alpha1.CVINamespace)); err != nil {
+	// is garbage-collected. The indexed lookup is bounded by the VM's own CVI
+	// population, not a scan of every CVI in vmware-system-csi (V6;
+	// implementation-rules §7).
+	cvis, err := vmopv1util.ListCVIsForVM(ctx, r.Client, vm)
+	if err != nil {
 		return fmt.Errorf("failed to list CsiVolumeInfo objects during VM deletion: %w", err)
 	}
 
-	for i := range cviList.Items {
-		cvi := &cviList.Items[i]
+	for i := range cvis {
+		cvi := &cvis[i]
 
-		if cvi.Spec.PVCNamespace != vm.Namespace {
-			continue
-		}
 		if vmopv1util.VMEntry(cvi, vm.Name) == nil {
 			continue
 		}

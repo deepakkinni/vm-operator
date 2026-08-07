@@ -9,13 +9,61 @@ import (
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
 	cnsv1alpha1 "github.com/vmware-tanzu/vm-operator/external/vsphere-csi-driver/api/v1alpha1"
 	pkgconst "github.com/vmware-tanzu/vm-operator/pkg/constants"
+	"github.com/vmware-tanzu/vm-operator/pkg/util/ptr"
 )
+
+const (
+	// CVIVMInstanceUUIDIndexKey is the field index registered on
+	// CsiVolumeInfo.spec.vms[*].vmInstanceUUID. It is the primary key for
+	// finding every CsiVolumeInfo that references a given VM without an
+	// unbounded namespace scan (attach/detach §13.5.1;
+	// implementation-rules §7).
+	CVIVMInstanceUUIDIndexKey = "spec.vms.vmInstanceUUID"
+
+	// CVIVMNameIndexKey is the field index registered on
+	// CsiVolumeInfo.spec.vms[*].vmName. It is the fallback key for entries
+	// written before vmInstanceUUID was observed. VM names are not unique
+	// cluster-wide, so callers must still filter the result by
+	// spec.pvcNamespace == the VM's namespace.
+	CVIVMNameIndexKey = "spec.vms.vmName"
+)
+
+// IndexCVIByVMInstanceUUID is the index function for CVIVMInstanceUUIDIndexKey.
+func IndexCVIByVMInstanceUUID(obj ctrlclient.Object) []string {
+	cvi, ok := obj.(*cnsv1alpha1.CsiVolumeInfo)
+	if !ok {
+		return nil
+	}
+	ids := make([]string, 0, len(cvi.Spec.VMs))
+	for _, e := range cvi.Spec.VMs {
+		if e.VMInstanceUUID != "" {
+			ids = append(ids, e.VMInstanceUUID)
+		}
+	}
+	return ids
+}
+
+// IndexCVIByVMName is the index function for CVIVMNameIndexKey.
+func IndexCVIByVMName(obj ctrlclient.Object) []string {
+	cvi, ok := obj.(*cnsv1alpha1.CsiVolumeInfo)
+	if !ok {
+		return nil
+	}
+	names := make([]string, 0, len(cvi.Spec.VMs))
+	for _, e := range cvi.Spec.VMs {
+		if e.VMName != "" {
+			names = append(names, e.VMName)
+		}
+	}
+	return names
+}
 
 // HasVMOwnedVolumesAnnotation reports whether the VM is a VM-owned-volumes VM that uses the
 // CsiVolumeInfo-based volume ownership path.
@@ -29,6 +77,44 @@ func CVINameForVolumeID(volumeID string) string {
 	return cnsv1alpha1.CVINamePrefix + volumeID
 }
 
+// resolvePVCVolume resolves the bound PV and CNS volume ID for the given
+// PVC. Returns an apierrors.IsNotFound-compatible error if the PVC is not
+// found, the PV it names does not exist, or (wrapped, not IsNotFound) if the
+// PVC is unbound or the PV has no CSI volume handle.
+func resolvePVCVolume(
+	ctx context.Context,
+	c ctrlclient.Client,
+	pvcNamespace, pvcName string) (pvc *corev1.PersistentVolumeClaim, pv *corev1.PersistentVolume, volumeID string, err error) {
+
+	pvc = &corev1.PersistentVolumeClaim{}
+	if err := c.Get(ctx, ctrlclient.ObjectKey{
+		Namespace: pvcNamespace,
+		Name:      pvcName,
+	}, pvc); err != nil {
+		return nil, nil, "", fmt.Errorf("failed to get PVC %s/%s: %w", pvcNamespace, pvcName, err)
+	}
+
+	pvName := pvc.Spec.VolumeName
+	if pvName == "" {
+		return nil, nil, "", fmt.Errorf("PVC %s/%s is not yet bound to a PV", pvcNamespace, pvcName)
+	}
+
+	pv = &corev1.PersistentVolume{}
+	if err := c.Get(ctx, ctrlclient.ObjectKey{Name: pvName}, pv); err != nil {
+		return nil, nil, "", fmt.Errorf("failed to get PV %s for PVC %s/%s: %w", pvName, pvcNamespace, pvcName, err)
+	}
+
+	if pv.Spec.CSI == nil {
+		return nil, nil, "", fmt.Errorf("PV %s does not have a CSI source", pvName)
+	}
+	volumeID = pv.Spec.CSI.VolumeHandle
+	if volumeID == "" {
+		return nil, nil, "", fmt.Errorf("PV %s has an empty CSI volumeHandle", pvName)
+	}
+
+	return pvc, pv, volumeID, nil
+}
+
 // GetCVIForPVC resolves the CsiVolumeInfo for the given PVC by looking up the
 // PV from the PVC's spec.volumeName and extracting the volumeHandle. Returns
 // an apierrors.IsNotFound-compatible error if the PVC, PV, or CVI is not found.
@@ -37,36 +123,11 @@ func GetCVIForPVC(
 	c ctrlclient.Client,
 	pvcNamespace, pvcName string) (*cnsv1alpha1.CsiVolumeInfo, error) {
 
-	// 1. Get the PVC.
-	pvc := &corev1.PersistentVolumeClaim{}
-	if err := c.Get(ctx, ctrlclient.ObjectKey{
-		Namespace: pvcNamespace,
-		Name:      pvcName,
-	}, pvc); err != nil {
-		return nil, fmt.Errorf("failed to get PVC %s/%s: %w", pvcNamespace, pvcName, err)
+	_, _, volumeID, err := resolvePVCVolume(ctx, c, pvcNamespace, pvcName)
+	if err != nil {
+		return nil, err
 	}
 
-	// 2. Get the PV from the PVC's spec.volumeName.
-	pvName := pvc.Spec.VolumeName
-	if pvName == "" {
-		return nil, fmt.Errorf("PVC %s/%s is not yet bound to a PV", pvcNamespace, pvcName)
-	}
-
-	pv := &corev1.PersistentVolume{}
-	if err := c.Get(ctx, ctrlclient.ObjectKey{Name: pvName}, pv); err != nil {
-		return nil, fmt.Errorf("failed to get PV %s for PVC %s/%s: %w", pvName, pvcNamespace, pvcName, err)
-	}
-
-	// 3. Extract volumeID from the PV's CSI source.
-	if pv.Spec.CSI == nil {
-		return nil, fmt.Errorf("PV %s does not have a CSI source", pvName)
-	}
-	volumeID := pv.Spec.CSI.VolumeHandle
-	if volumeID == "" {
-		return nil, fmt.Errorf("PV %s has an empty CSI volumeHandle", pvName)
-	}
-
-	// 4. Get CVI by name in the CSI system namespace.
 	cvi := &cnsv1alpha1.CsiVolumeInfo{}
 	if err := c.Get(ctx, ctrlclient.ObjectKey{
 		Namespace: cnsv1alpha1.CVINamespace,
@@ -76,6 +137,123 @@ func GetCVIForPVC(
 	}
 
 	return cvi, nil
+}
+
+// EnsureCVIForPVC resolves the CsiVolumeInfo for the given PVC, creating it
+// if it does not yet exist. Unlike GetCVIForPVC, a missing CVI is not an
+// error: on a VM-owned VM a missing CVI is an anomaly to repair, not a
+// brownfield PVC to skip (attach/detach §4.1.2, §13.1). vm-operator sets the
+// PV's ownerRef on the CVI it creates — a cluster-scoped owner with a
+// namespaced dependent, which Kubernetes permits — so the object is
+// collectible from the moment it exists, closing the window before CSI's
+// own reconcile backfills the same reference.
+func EnsureCVIForPVC(
+	ctx context.Context,
+	c ctrlclient.Client,
+	pvcNamespace, pvcName string) (*cnsv1alpha1.CsiVolumeInfo, error) {
+
+	pvc, pv, volumeID, err := resolvePVCVolume(ctx, c, pvcNamespace, pvcName)
+	if err != nil {
+		return nil, err
+	}
+
+	cviKey := ctrlclient.ObjectKey{
+		Namespace: cnsv1alpha1.CVINamespace,
+		Name:      CVINameForVolumeID(volumeID),
+	}
+
+	cvi := &cnsv1alpha1.CsiVolumeInfo{}
+	err = c.Get(ctx, cviKey, cvi)
+	switch {
+	case err == nil:
+		return cvi, nil
+	case !apierrors.IsNotFound(err):
+		return nil, fmt.Errorf("failed to get CsiVolumeInfo for volume %s: %w", volumeID, err)
+	}
+
+	cvi = &cnsv1alpha1.CsiVolumeInfo{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cviKey.Name,
+			Namespace: cviKey.Namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion:         corev1.SchemeGroupVersion.String(),
+					Kind:               "PersistentVolume",
+					Name:               pv.Name,
+					UID:                pv.UID,
+					Controller:         ptr.To(true),
+					BlockOwnerDeletion: ptr.To(true),
+				},
+			},
+		},
+		Spec: cnsv1alpha1.CsiVolumeInfoSpec{
+			VolumeID:     volumeID,
+			PVCName:      pvcName,
+			PVCNamespace: pvcNamespace,
+			PVName:       pvc.Spec.VolumeName,
+		},
+	}
+	if err := c.Create(ctx, cvi); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			if getErr := c.Get(ctx, cviKey, cvi); getErr != nil {
+				return nil, fmt.Errorf(
+					"failed to get CsiVolumeInfo for volume %s after AlreadyExists: %w", volumeID, getErr)
+			}
+			return cvi, nil
+		}
+		return nil, fmt.Errorf("failed to create CsiVolumeInfo for volume %s: %w", volumeID, err)
+	}
+
+	return cvi, nil
+}
+
+// ListCVIsForVM returns every CsiVolumeInfo in the CSI namespace with a
+// spec.vms entry for the given VM, bounded by the matching-VM population —
+// never a full-namespace scan (implementation-rules §7). It queries the
+// vmInstanceUUID index (the primary key, attach/detach §13.5.1) and, for
+// entries written before that field was observed, falls back to the vmName
+// index, filtered by spec.pvcNamespace to disambiguate VMs that share a name
+// across namespaces.
+func ListCVIsForVM(
+	ctx context.Context,
+	c ctrlclient.Client,
+	vm *vmopv1.VirtualMachine) ([]cnsv1alpha1.CsiVolumeInfo, error) {
+
+	byName := make(map[string]cnsv1alpha1.CsiVolumeInfo)
+	collect := func(list *cnsv1alpha1.CsiVolumeInfoList) {
+		for _, cvi := range list.Items {
+			if cvi.Spec.PVCNamespace != vm.Namespace {
+				continue
+			}
+			byName[cvi.Name] = cvi
+		}
+	}
+
+	if vm.Status.InstanceUUID != "" {
+		list := &cnsv1alpha1.CsiVolumeInfoList{}
+		if err := c.List(ctx, list,
+			ctrlclient.InNamespace(cnsv1alpha1.CVINamespace),
+			ctrlclient.MatchingFields{CVIVMInstanceUUIDIndexKey: vm.Status.InstanceUUID},
+		); err != nil {
+			return nil, fmt.Errorf("failed to list CsiVolumeInfo by vmInstanceUUID: %w", err)
+		}
+		collect(list)
+	}
+
+	nameList := &cnsv1alpha1.CsiVolumeInfoList{}
+	if err := c.List(ctx, nameList,
+		ctrlclient.InNamespace(cnsv1alpha1.CVINamespace),
+		ctrlclient.MatchingFields{CVIVMNameIndexKey: vm.Name},
+	); err != nil {
+		return nil, fmt.Errorf("failed to list CsiVolumeInfo by vmName: %w", err)
+	}
+	collect(nameList)
+
+	result := make([]cnsv1alpha1.CsiVolumeInfo, 0, len(byName))
+	for _, cvi := range byName {
+		result = append(result, cvi)
+	}
+	return result, nil
 }
 
 // DiskModeForVolume maps vm.spec.volumes[*].diskMode to the CsiVolumeInfo
