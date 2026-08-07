@@ -17,6 +17,7 @@ import (
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
 	ctxop "github.com/vmware-tanzu/vm-operator/pkg/context/operation"
+	pkgerr "github.com/vmware-tanzu/vm-operator/pkg/errors"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers"
 	res "github.com/vmware-tanzu/vm-operator/pkg/providers/vsphere/resources"
 )
@@ -99,6 +100,15 @@ func (vs *vSphereVMProvider) AttachVolumeDisks(
 		DeviceChange: deviceChanges,
 	}
 
+	// The sharpest correctness rule in this feature: setting VM-level CBT
+	// fans it out to every disk on the VM and permanently destroys a
+	// retained FCD's changeId (attach/detach §7.1.4; migration §5.6). No
+	// VM-owned reconfigure may ever carry it, so this is asserted
+	// structurally rather than left to convention.
+	if err := assertNoVMLevelCBT(configSpec); err != nil {
+		return nil, err
+	}
+
 	if _, err := resVM.Reconfigure(vmCtx, configSpec); err != nil {
 		return nil, fmt.Errorf("failed to attach %d volume disk(s) to VM %q: %w", len(deviceChanges), vm.Name, err)
 	}
@@ -176,6 +186,14 @@ func buildVolumeDisk(devices object.VirtualDeviceList, d providers.VolumeDiskAdd
 		},
 	}
 
+	if d.FcdID != "" {
+		// Identifies the device-add as a still-registered FCD so vpxd can
+		// derive linked-clone-ness from it. vm-operator supplies only the
+		// identity; no host-compatibility logic belongs here (attach/detach
+		// §7.1.5).
+		disk.VDiskId = &vimtypes.ID{Id: d.FcdID}
+	}
+
 	if d.ControllerBusNumber != nil && d.UnitNumber != nil {
 		controller, err := findControllerByTypeAndBus(devices, d.ControllerType, *d.ControllerBusNumber)
 		if err != nil {
@@ -251,6 +269,21 @@ func controllerTypeAndBus(dev vimtypes.BaseVirtualDevice) (vmopv1.VirtualControl
 	default:
 		return "", 0, false
 	}
+}
+
+// assertNoVMLevelCBT rejects a ConfigSpec that sets VM-level
+// changeTrackingEnabled. This must never appear in a VM-owned reconfigure:
+// it fans CBT out to every disk on the VM and permanently destroys a
+// retained FCD's changeId (attach/detach §7.1.4; migration §5.6). A guard
+// that fails the reconcile is strictly better than an irreversible data
+// loss that nobody notices.
+func assertNoVMLevelCBT(configSpec *vimtypes.VirtualMachineConfigSpec) error {
+	if configSpec.ChangeTrackingEnabled != nil {
+		return pkgerr.NoRequeueError{
+			Message: "refusing to reconfigure: VM-level changeTrackingEnabled must never be set on a VM-owned-volumes reconfigure",
+		}
+	}
+	return nil
 }
 
 // diskModeToVim maps vmopv1.VolumeDiskMode to the vSphere API's
@@ -356,6 +389,10 @@ func (vs *vSphereVMProvider) DetachDiskAtSlot(
 				Device:        disk,
 			},
 		},
+	}
+
+	if err := assertNoVMLevelCBT(configSpec); err != nil {
+		return "", err
 	}
 
 	if _, err := resVM.Reconfigure(vmCtx, configSpec); err != nil {

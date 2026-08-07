@@ -228,6 +228,57 @@ func TestBuildVolumeDisk(t *testing.T) {
 			t.Fatal("expected an error for a non-existent controller bus, got none")
 		}
 	})
+
+	t.Run("FcdID sets VDiskId on the device", func(t *testing.T) {
+		devices := object.VirtualDeviceList{newSCSIController(1000, 0)}
+
+		disk, err := buildVolumeDisk(devices, providers.VolumeDiskAddSpec{
+			VolumeName: "vol-1",
+			DiskPath:   "[ds1] retained.vmdk",
+			DiskMode:   vmopv1.VolumeDiskModePersistent,
+			FcdID:      "fcd-volume-id-123",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if disk.VDiskId == nil || disk.VDiskId.Id != "fcd-volume-id-123" {
+			t.Errorf("VDiskId = %+v, want Id=fcd-volume-id-123", disk.VDiskId)
+		}
+	})
+
+	t.Run("no FcdID leaves VDiskId unset", func(t *testing.T) {
+		devices := object.VirtualDeviceList{newSCSIController(1000, 0)}
+
+		disk, err := buildVolumeDisk(devices, providers.VolumeDiskAddSpec{
+			VolumeName: "vol-1",
+			DiskPath:   "[ds1] plain.vmdk",
+			DiskMode:   vmopv1.VolumeDiskModePersistent,
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if disk.VDiskId != nil {
+			t.Errorf("VDiskId = %+v, want nil for a disk that is not a registered FCD", disk.VDiskId)
+		}
+	})
+}
+
+func TestAssertNoVMLevelCBT(t *testing.T) {
+	t.Run("no ChangeTrackingEnabled is allowed", func(t *testing.T) {
+		if err := assertNoVMLevelCBT(&vimtypes.VirtualMachineConfigSpec{}); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("ChangeTrackingEnabled set, either value, is rejected", func(t *testing.T) {
+		for _, v := range []bool{true, false} {
+			enabled := v
+			err := assertNoVMLevelCBT(&vimtypes.VirtualMachineConfigSpec{ChangeTrackingEnabled: &enabled})
+			if err == nil {
+				t.Errorf("ChangeTrackingEnabled=%v: expected an error, got none", v)
+			}
+		}
+	})
 }
 
 func TestPlacementFromDisk(t *testing.T) {

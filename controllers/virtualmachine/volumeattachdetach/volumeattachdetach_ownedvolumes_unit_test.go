@@ -442,6 +442,57 @@ var _ = Describe(
 						})
 					})
 
+					When("VM has an fcd-retained dependent-persistent volume, green and ready", func() {
+						BeforeEach(func() {
+							pvc, pv, cvi := buildPVCWithCVI(pvcName, pvName, volID)
+							cvi.Spec.VMs = []cnsv1alpha1.VirtualMachineRef{
+								{VMName: vmName},
+							}
+							// fcd-retained: spec.diskUUID is never populated (csi.md C4).
+							cvi.Spec.DiskUUID = ""
+							cvi.Annotations = map[string]string{
+								cnsv1alpha1.FcdRetainedAnnotation: "true",
+							}
+							initObjects = append(initObjects, pvc, pv, cvi)
+
+							vm.Spec.Volumes = []vmopv1.VirtualMachineVolume{
+								{
+									Name: "vol-persistent",
+									VirtualMachineVolumeSource: vmopv1.VirtualMachineVolumeSource{
+										PersistentVolumeClaim: &vmopv1.PersistentVolumeClaimVolumeSource{
+											PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+												ClaimName: pvcName,
+											},
+										},
+									},
+								},
+							}
+						})
+
+						It("sets FcdID from the CVI's volumeID and takes the observed UUID as authoritative", func() {
+							var gotDisks []providers.VolumeDiskAddSpec
+							ctx.VMProvider.(*providerfake.VMProvider).AttachVolumeDisksFn = func(
+								_ context.Context, _ *vmopv1.VirtualMachine, disks []providers.VolumeDiskAddSpec,
+							) ([]providers.VolumeDiskPlacement, error) {
+								gotDisks = disks
+								return []providers.VolumeDiskPlacement{
+									{VolumeName: "vol-persistent", DiskUUID: "observed-uuid-from-device"},
+								}, nil
+							}
+
+							err := reconciler.ReconcileNormal(volCtx)
+							Expect(err).ToNot(HaveOccurred())
+
+							Expect(gotDisks).To(HaveLen(1))
+							Expect(gotDisks[0].FcdID).To(Equal(volID),
+								"FcdID must be the CVI's volumeID for an fcd-retained disk")
+
+							Expect(vm.Status.Volumes).To(HaveLen(1))
+							Expect(vm.Status.Volumes[0].DiskUUID).To(Equal("observed-uuid-from-device"),
+								"the observed UUID must be used since spec.diskUUID is empty for fcd-retained")
+						})
+					})
+
 					When("VM has a dependent-persistent volume but no CVI exists yet", func() {
 						BeforeEach(func() {
 							pvc := &corev1.PersistentVolumeClaim{

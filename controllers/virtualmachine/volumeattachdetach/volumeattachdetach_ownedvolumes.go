@@ -70,6 +70,7 @@ type readyDependentDisk struct {
 	plan     owned.VolumePlan
 	diskPath string
 	diskUUID string // spec.diskUUID, informational (§4.2.2); "" when fcd-retained
+	fcdID    string // set iff the disk is still a registered FCD (fcd-retained)
 }
 
 // reconcileOwnedVolumeAttach processes Workflow A: for each volume in spec.volumes
@@ -179,11 +180,21 @@ func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error
 			return fmt.Errorf("CsiVolumeInfo %s has empty diskPath after green signal", cvi.Name)
 		}
 
-		ready = append(ready, readyDependentDisk{
+		rd := readyDependentDisk{
 			plan:     plan,
 			diskPath: diskPath,
 			diskUUID: cvi.Spec.DiskUUID,
-		})
+		}
+		if vmopv1util.IsFcdRetained(cvi) {
+			// The FCD was never unregistered — it is still an FCD identity
+			// vpxd can use for its linked-clone precheck (attach/detach
+			// §7.1.5). CBT-per-disk does not apply here: §7.1.4 reserves
+			// that directive for independent disks, and the platform's
+			// default already produces the correct row for a dependent
+			// fcd-retained disk.
+			rd.fcdID = cvi.Spec.VolumeID
+		}
+		ready = append(ready, rd)
 	}
 
 	if len(ready) > 0 {
@@ -222,6 +233,7 @@ func (r *Reconciler) attachReadyDisks(
 			ControllerType:      rd.plan.ControllerType,
 			ControllerBusNumber: rd.plan.ControllerBusNumber,
 			UnitNumber:          rd.plan.UnitNumber,
+			FcdID:               rd.fcdID,
 		})
 	}
 
