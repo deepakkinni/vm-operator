@@ -324,3 +324,14 @@ func VMEntry(cvi *cnsv1alpha1.CsiVolumeInfo, vmName string) *cnsv1alpha1.Virtual
 	}
 	return nil
 }
+
+// RemoveVMEntry returns a new slice with the entry for vmName removed.
+func RemoveVMEntry(entries []cnsv1alpha1.VirtualMachineRef, vmName string) []cnsv1alpha1.VirtualMachineRef {
+	result := entries[:0]
+	for _, e := range entries {
+		if e.VMName != vmName {
+			result = append(result, e)
+		}
+	}
+	return result
+}

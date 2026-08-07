@@ -468,7 +468,7 @@ func (r *Reconciler) removeCVIEntryIfNotRetained(
 	}
 
 	patch := ctrlclient.MergeFrom(cvi.DeepCopy())
-	cvi.Spec.VMs = removeVMEntry(cvi.Spec.VMs, vm.Name)
+	cvi.Spec.VMs = vmopv1util.RemoveVMEntry(cvi.Spec.VMs, vm.Name)
 	if err := r.Client.Patch(ctx, cvi, patch); err != nil {
 		return fmt.Errorf("failed to patch CsiVolumeInfo %s during detach: %w", cvi.Name, err)
 	}
@@ -540,7 +540,7 @@ func (r *Reconciler) reconcileOwnedVolumeDelete(ctx *pkgctx.VolumeContext) error
 		}
 
 		patch := ctrlclient.MergeFrom(cvi.DeepCopy())
-		cvi.Spec.VMs = removeVMEntry(cvi.Spec.VMs, vm.Name)
+		cvi.Spec.VMs = vmopv1util.RemoveVMEntry(cvi.Spec.VMs, vm.Name)
 		if err := r.Client.Patch(ctx, cvi, patch); err != nil {
 			return fmt.Errorf("failed to patch CsiVolumeInfo %s during VM deletion: %w",
 				cvi.Name, err)
@@ -555,15 +555,4 @@ func (r *Reconciler) reconcileOwnedVolumeDelete(ctx *pkgctx.VolumeContext) error
 	ctx.Logger.Info("Removed CVICleanupFinalizer from VM-owned-volumes VM")
 
 	return nil
-}
-
-// removeVMEntry returns a new slice with the entry for vmName removed.
-func removeVMEntry(entries []cnsv1alpha1.VirtualMachineRef, vmName string) []cnsv1alpha1.VirtualMachineRef {
-	result := entries[:0]
-	for _, e := range entries {
-		if e.VMName != vmName {
-			result = append(result, e)
-		}
-	}
-	return result
 }

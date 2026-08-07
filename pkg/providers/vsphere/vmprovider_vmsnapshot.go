@@ -422,10 +422,15 @@ func (vs *vSphereVMProvider) reconcileSnapshotRevertDoTask(
 		"snapshot revert in progress",
 	)
 
-	// Before reverting, capture disk paths for volumes that will be dropped.
+	// Before reverting, capture disk paths for volumes that will be dropped,
+	// and remember which volumes those are so their CVI entries can be
+	// evaluated once the revert has actually dropped them (E.5, below).
 	// This is best-effort: failures are logged but do not block the revert.
+	var droppedByRevert []droppedVolume
 	if pkgcfg.FromContext(vmCtx).Features.VMOwnedVolumes && vmopv1util.HasVMOwnedVolumesAnnotation(vmCtx.VM) {
-		if err := vs.captureDroppedVolumeDiskPaths(vmCtx, obj); err != nil {
+		var err error
+		droppedByRevert, err = vs.captureDroppedVolumeDiskPaths(vmCtx, obj)
+		if err != nil {
 			logger.Error(err, "Failed to capture disk paths for volumes that will be dropped by revert")
 		}
 	}
@@ -471,6 +476,17 @@ func (vs *vSphereVMProvider) reconcileSnapshotRevertDoTask(
 		"afterRestoreAnnotations", vmCtx.VM.Annotations,
 		"afterRestoreLabels", vmCtx.VM.Labels,
 		"afterRestoreSpecCurrentSnapshot", vmCtx.VM.Spec.CurrentSnapshotName)
+
+	// Workflow E.5: the revert has now actually dropped droppedByRevert from
+	// vm.spec.volumes — evaluate each one's CVI entry for removal. This is
+	// best-effort, matching the capture step above: a failure here is a
+	// visible requeue on the next detach pass, not a reason to fail a
+	// revert that has already succeeded.
+	if len(droppedByRevert) > 0 {
+		if err := vs.evaluateDroppedVolumeCVIEntries(vmCtx, droppedByRevert); err != nil {
+			logger.Error(err, "Failed to evaluate CsiVolumeInfo entries for volumes dropped by revert")
+		}
+	}
 
 	logger.Info("Successfully completed reverted snapshot")
 

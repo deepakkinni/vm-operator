@@ -12,6 +12,7 @@ import (
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/vim25/mo"
 	vimtypes "github.com/vmware/govmomi/vim25/types"
+	apierrorsutil "k8s.io/apimachinery/pkg/util/errors"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
@@ -188,30 +189,40 @@ func (vs *vSphereVMProvider) GetDiskPathFromSnapshot(
 	return "", fmt.Errorf("disk UUID %q not found in snapshot %q device config", diskUUID, snapshotName)
 }
 
+// droppedVolume identifies a PVC-backed volume that a snapshot revert is
+// about to drop from vm.spec.volumes.
+type droppedVolume struct {
+	PVCName  string
+	DiskUUID string
+}
+
 // captureDroppedVolumeDiskPaths records the current VMDK datastore paths for
-// volumes that will be dropped by the upcoming snapshot revert. This is a
-// best-effort, just-in-time capture: if it fails, Workflow B (reconcile
-// vm-owned volume detach) will handle re-registration on the next reconcile pass.
+// volumes that will be dropped by the upcoming snapshot revert, and returns
+// those volumes so the caller can run the post-revert CVI evaluation
+// (E.5, evaluateDroppedVolumeCVIEntries) once the revert completes. This is
+// a best-effort, just-in-time capture: if it fails for one volume, Workflow
+// B (reconcile vm-owned volume detach) will handle re-registration on the
+// next reconcile pass.
 //
 // NOTE: This covers managed snapshots only (those with a VirtualMachineSnapshot
 // CR). Unmanaged snapshots (out-of-band, no CR) require a vCenter snapshot tree
 // query as the authoritative backstop; that is left for a follow-up.
 func (vs *vSphereVMProvider) captureDroppedVolumeDiskPaths(
 	vmCtx pkgctx.VirtualMachineContext,
-	snapCR *vmopv1.VirtualMachineSnapshot) error {
+	snapCR *vmopv1.VirtualMachineSnapshot) ([]droppedVolume, error) {
 
 	if !pkgcfg.FromContext(vmCtx).Features.VMOwnedVolumes {
-		return nil
+		return nil, nil
 	}
 	if !vmopv1util.HasVMOwnedVolumesAnnotation(vmCtx.VM) {
-		return nil
+		return nil, nil
 	}
 
 	// Read the target snapshot's PVC disk data to know which PVCs were present
 	// at snapshot time.
 	snapDisks, err := vs.GetPVCDiskDataFromSnapshot(vmCtx, vmCtx.VM, snapCR.Name)
 	if err != nil {
-		return fmt.Errorf("failed to read PVC disk data from target snapshot %q: %w", snapCR.Name, err)
+		return nil, fmt.Errorf("failed to read PVC disk data from target snapshot %q: %w", snapCR.Name, err)
 	}
 
 	// Build a set of PVC names present in the snapshot.
@@ -220,8 +231,11 @@ func (vs *vSphereVMProvider) captureDroppedVolumeDiskPaths(
 		snapPVCSet[d.PVCName] = struct{}{}
 	}
 
-	// For each volume currently on the VM that is NOT in the snapshot, capture
-	// its disk path and record it in the CVI so the attach path can use it.
+	dropped := make([]droppedVolume, 0, len(vmCtx.VM.Spec.Volumes))
+
+	// For each volume currently on the VM that is NOT in the snapshot, it
+	// will be dropped by the revert: capture its current disk path and
+	// record it in the CVI so the attach path can use it.
 	for _, vol := range vmCtx.VM.Spec.Volumes {
 		if vol.PersistentVolumeClaim == nil {
 			continue
@@ -231,8 +245,9 @@ func (vs *vSphereVMProvider) captureDroppedVolumeDiskPaths(
 			continue
 		}
 
-		// Volume will be dropped by the revert. Capture its current disk path.
 		statusEntry := findVolumeStatusEntry(vmCtx.VM, vol.Name)
+		dropped = append(dropped, droppedVolume{PVCName: claimName, DiskUUID: diskUUIDOf(statusEntry)})
+
 		if statusEntry == nil ||
 			statusEntry.ControllerBusNumber == nil ||
 			statusEntry.UnitNumber == nil {
@@ -273,7 +288,41 @@ func (vs *vSphereVMProvider) captureDroppedVolumeDiskPaths(
 			"volumeName", vol.Name, "pvcName", claimName, "diskPath", diskPath)
 	}
 
-	return nil
+	return dropped, nil
+}
+
+// diskUUIDOf returns statusEntry's DiskUUID, or "" if statusEntry is nil.
+func diskUUIDOf(statusEntry *vmopv1.VirtualMachineVolumeStatus) string {
+	if statusEntry == nil {
+		return ""
+	}
+	return statusEntry.DiskUUID
+}
+
+// evaluateDroppedVolumeCVIEntries is Workflow E.5: after a snapshot revert
+// has dropped the given volumes from vm.spec.volumes, remove each one's VM
+// entry from its CsiVolumeInfo unless another snapshot still retains the
+// disk. It shares its retention evaluation and removal with Workflow D.4
+// (evaluateCVIForDeletedSnapshot) via vmopv1util.RemoveVMEntryIfNotRetained
+// — the only difference is that a dropped volume is by definition no longer
+// on the VM, so only the snapshot question remains, and no snapshot is
+// excluded from the fast-path check (no snapshot is being deleted here).
+//
+// This makes E.5 explicit rather than relying on it to happen to work as a
+// side effect of Workflow B's detach path, which stopped covering this case
+// once detach began correlating by volumeName instead of diskUUID.
+func (vs *vSphereVMProvider) evaluateDroppedVolumeCVIEntries(
+	vmCtx pkgctx.VirtualMachineContext,
+	dropped []droppedVolume) error {
+
+	var errs []error
+	for _, d := range dropped {
+		if err := vmopv1util.RemoveVMEntryIfNotRetained(
+			vmCtx, vs.k8sClient, vs, vmCtx.Logger, vmCtx.VM, vmCtx.VM.Name, "", d.PVCName, d.DiskUUID); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return apierrorsutil.NewAggregate(errs)
 }
 
 // findVolumeStatusEntry returns the VirtualMachineVolumeStatus entry for the

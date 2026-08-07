@@ -750,7 +750,9 @@ func unitTestsOwnedVolumesDiskPathRefresh() {
 		vmName    = "dummy-vm"
 		snapName  = "snap-2"
 		pvcName   = "pvc-test-1"
-		diskUUID  = "6000C29-abc"
+		pvName    = "pv-test-1"
+		volumeID  = "cns-volume-id-999" // the CNS volume ID — distinct from diskUUID
+		diskUUID  = "6000C29-abc"       // the VirtualDisk backing UUID, NOT the CNS volume ID
 		deltaPath = "[ds] vm/pvc-test-1-000001.vmdk"
 		basePath  = "[ds] vm/pvc-test-1.vmdk"
 	)
@@ -778,21 +780,39 @@ func unitTestsOwnedVolumesDiskPathRefresh() {
 		vmSnapshot = builder.DummyVirtualMachineSnapshot(ns, snapName, vmName)
 		vmSnapshot.DeletionTimestamp = &now
 
+		// The CVI is resolved via PVCName -> PV -> volumeHandle (§4.2.1), not
+		// by diskUUID — diskUUID is only the VirtualDisk backing UUID used to
+		// pick the right device out of the snapshot's saved config.
+		pvc := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: pvcName, Namespace: ns},
+			Spec:       corev1.PersistentVolumeClaimSpec{VolumeName: pvName},
+		}
+		pv := &corev1.PersistentVolume{
+			ObjectMeta: metav1.ObjectMeta{Name: pvName},
+			Spec: corev1.PersistentVolumeSpec{
+				PersistentVolumeSource: corev1.PersistentVolumeSource{
+					CSI: &corev1.CSIPersistentVolumeSource{VolumeHandle: volumeID},
+				},
+			},
+		}
+
 		cvi = &cnsv1alpha1.CsiVolumeInfo{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      vmopv1util.CVINameForVolumeID(diskUUID),
+				Name:      vmopv1util.CVINameForVolumeID(volumeID),
 				Namespace: cnsv1alpha1.CVINamespace,
 			},
 			Spec: cnsv1alpha1.CsiVolumeInfoSpec{
-				VolumeID: diskUUID,
-				DiskPath: deltaPath, // stale delta path — this is the bug state
+				VolumeID:     volumeID,
+				PVCName:      pvcName,
+				PVCNamespace: ns,
+				DiskPath:     deltaPath, // stale delta path — this is the bug state
 				VMs: []cnsv1alpha1.VirtualMachineRef{
 					{VMName: vmName},
 				},
 			},
 		}
 
-		initObjects = []client.Object{vm, vmSnapshot, cvi}
+		initObjects = []client.Object{vm, vmSnapshot, pvc, pv, cvi}
 	})
 
 	JustBeforeEach(func() {
@@ -853,7 +873,7 @@ func unitTestsOwnedVolumesDiskPathRefresh() {
 				Expect(ctx.Client.Get(ctx,
 					types.NamespacedName{
 						Namespace: cnsv1alpha1.CVINamespace,
-						Name:      vmopv1util.CVINameForVolumeID(diskUUID),
+						Name:      vmopv1util.CVINameForVolumeID(volumeID),
 					}, updated)).To(Succeed())
 				Expect(updated.Spec.DiskPath).To(Equal(basePath))
 			})
@@ -881,7 +901,7 @@ func unitTestsOwnedVolumesDiskPathRefresh() {
 				Expect(ctx.Client.Get(ctx,
 					types.NamespacedName{
 						Namespace: cnsv1alpha1.CVINamespace,
-						Name:      vmopv1util.CVINameForVolumeID(diskUUID),
+						Name:      vmopv1util.CVINameForVolumeID(volumeID),
 					}, updated)).To(Succeed())
 				// DiskPath must not have been updated on error.
 				Expect(updated.Spec.DiskPath).To(Equal(deltaPath))

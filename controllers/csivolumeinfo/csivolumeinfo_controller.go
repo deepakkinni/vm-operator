@@ -32,6 +32,7 @@ import (
 	pkglog "github.com/vmware-tanzu/vm-operator/pkg/log"
 	"github.com/vmware-tanzu/vm-operator/pkg/patch"
 	"github.com/vmware-tanzu/vm-operator/pkg/record"
+	vmopv1util "github.com/vmware-tanzu/vm-operator/pkg/util/vmopv1"
 )
 
 const (
@@ -170,7 +171,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Re
 	}
 
 	for _, vmName := range orphaned {
-		cvi.Spec.VMs = removeVMEntryByName(cvi.Spec.VMs, vmName)
+		cvi.Spec.VMs = vmopv1util.RemoveVMEntry(cvi.Spec.VMs, vmName)
 		logger.Info("Removed orphaned VM entry from CsiVolumeInfo", "vmName", vmName)
 	}
 	clearOrphanSuspicion(cvi)
@@ -256,15 +257,4 @@ func clearOrphanSuspicion(cvi *cnsv1alpha1.CsiVolumeInfo) {
 	}
 	delete(cvi.Annotations, orphanSuspectedAtAnnotation)
 	delete(cvi.Annotations, orphanSuspectedEntriesAnnotation)
-}
-
-// removeVMEntryByName returns a new slice with the entry for vmName removed.
-func removeVMEntryByName(entries []cnsv1alpha1.VirtualMachineRef, vmName string) []cnsv1alpha1.VirtualMachineRef {
-	result := entries[:0]
-	for _, e := range entries {
-		if e.VMName != vmName {
-			result = append(result, e)
-		}
-	}
-	return result
 }

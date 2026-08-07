@@ -9,6 +9,7 @@ import (
 	"fmt"
 
 	"github.com/go-logr/logr"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
@@ -106,4 +107,65 @@ func IsDiskRetainedBySnapshot(
 	}
 
 	return retained, nil
+}
+
+// RemoveVMEntryIfNotRetained removes vmName's entry from the CsiVolumeInfo
+// for the given PVC unless a VM snapshot still retains the disk, in which
+// case the entry is a hold that must persist — removing it would trigger a
+// premature (and failing) re-registration (spec §5.4, §11.2 E.5). A missing
+// CVI or a CVI with no entry for vmName is a no-op, not an error.
+//
+// Shared by Workflow D.4 (snapshot delete) and E.5 (post-revert
+// evaluation): the only difference between the two call sites is which set
+// of "dropped" volumes they evaluate and, for D.4, which snapshot to
+// exclude from the fast-path retention check.
+func RemoveVMEntryIfNotRetained(
+	ctx context.Context,
+	c ctrlclient.Client,
+	provider SnapshotRetentionProvider,
+	logger logr.Logger,
+	vm *vmopv1.VirtualMachine,
+	vmName, excludeSnapshotName, pvcName, diskUUID string) error {
+
+	cvi, err := GetCVIForPVC(ctx, c, vm.Namespace, pvcName)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to get CsiVolumeInfo for PVC %q: %w", pvcName, err)
+	}
+
+	entry := VMEntry(cvi, vmName)
+	if entry == nil {
+		return nil
+	}
+
+	if !IsDependentMode(entry.DiskMode) {
+		// Independent disks are excluded from VM snapshots by vSphere and
+		// never appear in a snapshot's pvc.disk.data — reaching here means
+		// an assumption about the platform is wrong, so this is surfaced
+		// rather than silently handled like the dependent case.
+		logger.Info("Independent-mode volume found in a snapshot's disk list; unexpected, leaving CVI entry alone",
+			"pvcName", pvcName, "vmName", vmName)
+		return nil
+	}
+
+	retained, err := IsDiskRetainedBySnapshot(ctx, c, provider, logger, vm, excludeSnapshotName, pvcName, diskUUID)
+	if err != nil {
+		return fmt.Errorf("failed to check snapshot retention for PVC %q: %w", pvcName, err)
+	}
+	if retained {
+		logger.V(4).Info("Disk is retained by another snapshot, keeping CVI entry",
+			"pvcName", pvcName, "vmName", vmName)
+		return nil
+	}
+
+	patch := ctrlclient.MergeFrom(cvi.DeepCopy())
+	cvi.Spec.VMs = RemoveVMEntry(cvi.Spec.VMs, vmName)
+	if err := c.Patch(ctx, cvi, patch); err != nil {
+		return fmt.Errorf("failed to patch CsiVolumeInfo to remove VM entry for PVC %q: %w", pvcName, err)
+	}
+
+	logger.Info("Removed VM entry from CsiVolumeInfo", "pvcName", pvcName, "vmName", vmName)
+	return nil
 }
