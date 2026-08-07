@@ -24,6 +24,7 @@ import (
 	"github.com/vmware-tanzu/vm-operator/pkg/constants/testlabels"
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
 	pkgerr "github.com/vmware-tanzu/vm-operator/pkg/errors"
+	"github.com/vmware-tanzu/vm-operator/pkg/providers"
 	providerfake "github.com/vmware-tanzu/vm-operator/pkg/providers/fake"
 	"github.com/vmware-tanzu/vm-operator/pkg/util/ptr"
 	vmopv1util "github.com/vmware-tanzu/vm-operator/pkg/util/vmopv1"
@@ -607,9 +608,29 @@ var _ = Describe(
 							}
 						})
 
-						It("attaches all disks and returns nil", func() {
+						It("attaches all disks in a single batched call and returns nil", func() {
+							attachCalls := 0
+							ctx.VMProvider.(*providerfake.VMProvider).AttachVolumeDisksFn = func(
+								_ context.Context, _ *vmopv1.VirtualMachine, disks []providers.VolumeDiskAddSpec,
+							) ([]providers.VolumeDiskPlacement, error) {
+								attachCalls++
+								placements := make([]providers.VolumeDiskPlacement, len(disks))
+								for i, d := range disks {
+									placements[i] = providers.VolumeDiskPlacement{
+										VolumeName:          d.VolumeName,
+										DiskUUID:            "observed-" + d.VolumeName,
+										ControllerType:      vmopv1.VirtualControllerTypeSCSI,
+										ControllerBusNumber: 0,
+										UnitNumber:          int32(i + 1),
+									}
+								}
+								return placements, nil
+							}
+
 							err := reconciler.ReconcileNormal(volCtx)
 							Expect(err).ToNot(HaveOccurred())
+							Expect(attachCalls).To(Equal(1),
+								"both ready disks must be attached in one ReconfigVM_Task, not one per disk")
 
 							Expect(vm.Status.Volumes).To(HaveLen(2))
 							names := []string{
@@ -619,8 +640,10 @@ var _ = Describe(
 							Expect(names).To(ConsistOf("vol-1", "vol-2"))
 							for _, v := range vm.Status.Volumes {
 								Expect(v.Type).To(Equal(vmopv1.VolumeTypeManaged))
-								Expect(v.DiskUUID).ToNot(BeEmpty())
+								Expect(v.DiskUUID).To(Equal("observed-" + v.Name))
 								Expect(v.Attached).To(BeTrue())
+								Expect(v.ControllerType).To(Equal(vmopv1.VirtualControllerTypeSCSI))
+								Expect(v.UnitNumber).NotTo(BeNil())
 							}
 						})
 					})

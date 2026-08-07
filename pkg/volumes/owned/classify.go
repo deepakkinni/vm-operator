@@ -23,10 +23,21 @@ type VolumePlan struct {
 	ClaimName string
 	// DiskMode is the CsiVolumeInfo-side disk mode for this volume.
 	DiskMode cnsv1alpha1.CVIDiskMode
+	// RawDiskMode is vm.spec.volumes[*].diskMode verbatim (may be empty),
+	// for callers building a vSphere device spec, which speaks
+	// vmopv1.VolumeDiskMode rather than the CVI's mirrored enum.
+	RawDiskMode vmopv1.VolumeDiskMode
 	// Dependent is true when DiskMode requires CSI's ownership-transfer
 	// behavior (best-effort unregister). False means the FCD stays
 	// registered and CSIManaged.
 	Dependent bool
+	// SharingMode is vm.spec.volumes[*].sharingMode.
+	SharingMode vmopv1.VolumeSharingMode
+	// ControllerType, ControllerBusNumber, and UnitNumber are the user's
+	// explicit slot request, if any.
+	ControllerType      vmopv1.VirtualControllerType
+	ControllerBusNumber *int32
+	UnitNumber          *int32
 }
 
 // ClassifyVolumes returns the plan for every PVC-backed volume in
@@ -44,10 +55,15 @@ func ClassifyVolumes(vm *vmopv1.VirtualMachine) []VolumePlan {
 
 		diskMode := vmopv1util.DiskModeForVolume(vol)
 		plans = append(plans, VolumePlan{
-			VolumeName: vol.Name,
-			ClaimName:  vol.PersistentVolumeClaim.ClaimName,
-			DiskMode:   diskMode,
-			Dependent:  vmopv1util.IsDependentMode(diskMode),
+			VolumeName:          vol.Name,
+			ClaimName:           vol.PersistentVolumeClaim.ClaimName,
+			DiskMode:            diskMode,
+			RawDiskMode:         vol.DiskMode,
+			Dependent:           vmopv1util.IsDependentMode(diskMode),
+			SharingMode:         vol.SharingMode,
+			ControllerType:      vol.ControllerType,
+			ControllerBusNumber: vol.ControllerBusNumber,
+			UnitNumber:          vol.UnitNumber,
 		})
 	}
 

@@ -17,6 +17,7 @@ import (
 	pkgconst "github.com/vmware-tanzu/vm-operator/pkg/constants"
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
 	pkgerr "github.com/vmware-tanzu/vm-operator/pkg/errors"
+	"github.com/vmware-tanzu/vm-operator/pkg/providers"
 	vmopv1util "github.com/vmware-tanzu/vm-operator/pkg/util/vmopv1"
 	"github.com/vmware-tanzu/vm-operator/pkg/volumes/owned"
 )
@@ -63,6 +64,14 @@ func (r *Reconciler) reconcileOwnedVolumes(ctx *pkgctx.VolumeContext) error {
 	return nil
 }
 
+// readyDependentDisk pairs a ready-to-attach dependent volume with the
+// resolved backing path and mode needed to build its device.
+type readyDependentDisk struct {
+	plan     owned.VolumePlan
+	diskPath string
+	diskUUID string // spec.diskUUID, informational (§4.2.2); "" when fcd-retained
+}
+
 // reconcileOwnedVolumeAttach processes Workflow A: for each volume in spec.volumes
 // that does not yet appear in status.volumes with an attached disk, write the
 // VM entry to the CsiVolumeInfo spec.vms and, once ready, attach the disk
@@ -72,8 +81,16 @@ func (r *Reconciler) reconcileOwnedVolumes(ctx *pkgctx.VolumeContext) error {
 // regardless of disk mode (attach/detach §2.7) — disk mode only selects the
 // ownership behavior. Volumes whose CVI is not yet ready (entry just
 // patched, or a dependent volume's green signal absent) set needRequeue and
-// continue — they do not block later volumes that are ready. A single
-// RequeueError is returned at the end if any volume is still pending.
+// continue — they do not block later volumes that are ready. Ready dependent
+// volumes are collected and attached in a single ReconfigVM_Task (attach/detach
+// §7.3 note); a single RequeueError is returned at the end if any volume is
+// still pending.
+//
+// Independent-mode device attach (backing resolution, vDiskId, per-disk CBT)
+// is not yet implemented — it depends on a CNS/vslm client this codebase does
+// not have. The entry is written to the CVI; the device add itself requeues
+// indefinitely until that dependency lands (see V3/V4 in the implementation
+// plan).
 func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error {
 
 	vm := ctx.VM
@@ -87,6 +104,7 @@ func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error
 	}
 
 	needRequeue := false
+	ready := make([]readyDependentDisk, 0, len(vm.Spec.Volumes))
 
 	for _, plan := range owned.ClassifyVolumes(vm) {
 		// Already attached — nothing to do.
@@ -140,9 +158,9 @@ func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error
 		}
 
 		if !plan.Dependent {
-			// Independent-mode readiness and device attach (backing
-			// resolution, vDiskId, per-disk CBT) land in V3/V4. The entry is
-			// on the CVI; the device add itself is not yet implemented.
+			// Independent-mode readiness and device attach land in a later
+			// change — see the function doc comment. The entry is on the
+			// CVI; the device add itself is not yet implemented.
 			ctx.Logger.Info("Independent-mode VM-owned volume entry present; device attach pending",
 				"pvc", claimName, "cvi", cvi.Name)
 			needRequeue = true
@@ -156,33 +174,22 @@ func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error
 			continue
 		}
 
-		// Green signal present — attach the disk to the VM.
 		diskPath := cvi.Spec.DiskPath
 		if diskPath == "" {
 			return fmt.Errorf("CsiVolumeInfo %s has empty diskPath after green signal", cvi.Name)
 		}
 
-		if err := r.VMProvider.AttachOrphanedDiskToVM(ctx, vm, diskPath); err != nil {
-			return fmt.Errorf("failed to attach orphaned disk for PVC %s: %w", claimName, err)
-		}
-
-		ctx.Logger.Info("Added VM-owned disk to VM", "pvc", claimName, "diskPath", diskPath)
-
-		// Record the diskUUID from the CVI so that the detach path can correlate
-		// this VM status entry back to the CsiVolumeInfo after the volume is
-		// removed from spec.volumes. Slot info is observed by the VM controller
-		// on a later reconcile.
-		// Attached is set to true immediately: AttachOrphanedDiskToVM only
-		// returns here on a successful ReconfigVM, so the disk is physically
-		// present. session.reconcileVolumes gates power-on on Attached=true for
-		// every PVC-backed volume, so setting it here unblocks the first
-		// power-on after attach.
-		vm.Status.Volumes = append(vm.Status.Volumes, vmopv1.VirtualMachineVolumeStatus{
-			Name:     plan.VolumeName,
-			Type:     vmopv1.VolumeTypeManaged,
-			DiskUUID: cvi.Spec.DiskUUID,
-			Attached: true,
+		ready = append(ready, readyDependentDisk{
+			plan:     plan,
+			diskPath: diskPath,
+			diskUUID: cvi.Spec.DiskUUID,
 		})
+	}
+
+	if len(ready) > 0 {
+		if err := r.attachReadyDisks(ctx, vm, ready); err != nil {
+			return err
+		}
 	}
 
 	if needRequeue {
@@ -190,6 +197,78 @@ func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error
 			After:   5 * time.Second,
 			Message: "waiting for CSI to process CsiVolumeInfo updates",
 		}
+	}
+
+	return nil
+}
+
+// attachReadyDisks issues one ReconfigVM_Task for every ready dependent disk
+// (attach/detach §7.3 note — as few reconfigures as possible) and writes
+// vm.status.volumes from the returned placements, including the observed
+// device slot (§7.3 A.6) — populating it here, at attach, is what lets the
+// detach path (V5) stop correlating by diskUUID.
+func (r *Reconciler) attachReadyDisks(
+	ctx *pkgctx.VolumeContext,
+	vm *vmopv1.VirtualMachine,
+	ready []readyDependentDisk) error {
+
+	disks := make([]providers.VolumeDiskAddSpec, 0, len(ready))
+	for _, rd := range ready {
+		disks = append(disks, providers.VolumeDiskAddSpec{
+			VolumeName:          rd.plan.VolumeName,
+			DiskPath:            rd.diskPath,
+			DiskMode:            rd.plan.RawDiskMode,
+			SharingMode:         rd.plan.SharingMode,
+			ControllerType:      rd.plan.ControllerType,
+			ControllerBusNumber: rd.plan.ControllerBusNumber,
+			UnitNumber:          rd.plan.UnitNumber,
+		})
+	}
+
+	placements, err := r.VMProvider.AttachVolumeDisks(ctx, vm, disks)
+	if err != nil {
+		// Surface the failure against every disk in the batch, naming none
+		// as the culprit — vCenter rejects the whole ReconfigVM_Task for a
+		// malformed spec on any one disk, so triage must start from the
+		// error message, not from a partial result.
+		return fmt.Errorf("failed to attach %d VM-owned disk(s): %w", len(disks), err)
+	}
+
+	placementByVolume := make(map[string]providers.VolumeDiskPlacement, len(placements))
+	for _, p := range placements {
+		placementByVolume[p.VolumeName] = p
+	}
+
+	for _, rd := range ready {
+		p, ok := placementByVolume[rd.plan.VolumeName]
+		if !ok {
+			return fmt.Errorf("no placement returned for volume %q after attach", rd.plan.VolumeName)
+		}
+
+		diskUUID := p.DiskUUID
+		if diskUUID == "" {
+			// fcd-retained: spec.diskUUID is never populated (csi.md C4), so
+			// the observed UUID from the device is authoritative.
+			diskUUID = rd.diskUUID
+		}
+
+		ctx.Logger.Info("Added VM-owned disk to VM",
+			"volumeName", rd.plan.VolumeName, "diskPath", rd.diskPath, "diskUUID", diskUUID)
+
+		// Attached is set to true immediately: AttachVolumeDisks only
+		// returns here on a successful ReconfigVM, so every disk in the
+		// batch is physically present. session.reconcileVolumes gates
+		// power-on on Attached=true for every PVC-backed volume, so setting
+		// it here unblocks the first power-on after attach.
+		vm.Status.Volumes = append(vm.Status.Volumes, vmopv1.VirtualMachineVolumeStatus{
+			Name:                rd.plan.VolumeName,
+			Type:                vmopv1.VolumeTypeManaged,
+			DiskUUID:            diskUUID,
+			Attached:            true,
+			ControllerType:      p.ControllerType,
+			ControllerBusNumber: &p.ControllerBusNumber,
+			UnitNumber:          &p.UnitNumber,
+		})
 	}
 
 	return nil

@@ -93,17 +93,18 @@ type VirtualMachineProviderInterface interface {
 	// SyncVMSnapshotTreeStatus syncs the VM's current and root snapshots status.
 	SyncVMSnapshotTreeStatus(ctx context.Context, vm *vmopv1.VirtualMachine) error
 
-	// AttachOrphanedDiskToVM adds an existing VMDK (identified by its datastore
-	// path) to the virtual machine as a plain disk without creating a new virtual
-	// disk. This is used for the VM-owned volume attach path where the FCD has
-	// been unregistered and the VMDK must be re-attached to the VM.
-	AttachOrphanedDiskToVM(ctx context.Context, vm *vmopv1.VirtualMachine, diskPath string) error
-
 	// DetachDiskAtSlot removes the virtual disk at the given SCSI/controller
 	// slot from the virtual machine without deleting the underlying VMDK file.
 	// The slot is identified by controllerType, controllerBusNumber, and
 	// unitNumber as recorded in vm.status.volumes.
 	DetachDiskAtSlot(ctx context.Context, vm *vmopv1.VirtualMachine, controllerType vmopv1.VirtualControllerType, controllerBusNumber, unitNumber int32) (diskPath string, retErr error)
+
+	// AttachVolumeDisks adds each of the given disks to the VM in a single
+	// ReconfigVM_Task. A disk already present at its backing path is omitted
+	// from the request but still reported in the result, so a partially
+	// applied batch converges on retry. Returns the resolved slot of every
+	// disk in disks, whether newly added or already present.
+	AttachVolumeDisks(ctx context.Context, vm *vmopv1.VirtualMachine, disks []VolumeDiskAddSpec) ([]VolumeDiskPlacement, error)
 
 	// GetPVCDiskDataFromSnapshot reads the PVCDiskData ExtraConfig key from the
 	// named vSphere snapshot and returns the decoded list of PVC-backed disk

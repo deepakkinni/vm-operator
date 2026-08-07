@@ -72,6 +72,8 @@ type funcs struct {
 	GetPVCDiskDataFromSnapshotFn  func(ctx context.Context, vm *vmopv1.VirtualMachine, snapshotName string) ([]backupapi.PVCDiskData, error)
 	IsDiskRetainedByAnySnapshotFn func(ctx context.Context, vm *vmopv1.VirtualMachine, diskUUID string) (bool, error)
 	GetDiskPathFromSnapshotFn     func(ctx context.Context, vm *vmopv1.VirtualMachine, snapshotName, diskUUID string) (string, error)
+
+	AttachVolumeDisksFn func(ctx context.Context, vm *vmopv1.VirtualMachine, disks []providers.VolumeDiskAddSpec) ([]providers.VolumeDiskPlacement, error)
 }
 
 type VMProvider struct {
@@ -489,14 +491,28 @@ func (s *VMProvider) SyncVMSnapshotTreeStatus(ctx context.Context, vm *vmopv1.Vi
 	return nil
 }
 
-// AttachOrphanedDiskToVM is a no-op stub for the fake provider.
-func (s *VMProvider) AttachOrphanedDiskToVM(_ context.Context, _ *vmopv1.VirtualMachine, _ string) error {
-	return nil
-}
-
 // DetachDiskAtSlot is a no-op stub for the fake provider.
 func (s *VMProvider) DetachDiskAtSlot(_ context.Context, _ *vmopv1.VirtualMachine, _ vmopv1.VirtualControllerType, _, _ int32) (string, error) {
 	return "", nil
+}
+
+// AttachVolumeDisks delegates to AttachVolumeDisksFn if set, otherwise
+// returns a placement for every disk with no controller/UUID info filled in.
+func (s *VMProvider) AttachVolumeDisks(
+	ctx context.Context,
+	vm *vmopv1.VirtualMachine,
+	disks []providers.VolumeDiskAddSpec) ([]providers.VolumeDiskPlacement, error) {
+
+	s.Lock()
+	defer s.Unlock()
+	if s.AttachVolumeDisksFn != nil {
+		return s.AttachVolumeDisksFn(ctx, vm, disks)
+	}
+	placements := make([]providers.VolumeDiskPlacement, len(disks))
+	for i, d := range disks {
+		placements[i] = providers.VolumeDiskPlacement{VolumeName: d.VolumeName}
+	}
+	return placements, nil
 }
 
 // GetPVCDiskDataFromSnapshot delegates to GetPVCDiskDataFromSnapshotFn if set.
