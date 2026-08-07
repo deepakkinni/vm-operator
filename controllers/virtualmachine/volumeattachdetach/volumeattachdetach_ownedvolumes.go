@@ -115,6 +115,11 @@ func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error
 
 		claimName := plan.ClaimName
 
+		// Writing this entry is the only PVC-usage bookkeeping vm-operator
+		// does here. The `cns.vmware.com/usedby-vm-<uuid>` label on the PVC
+		// is CSI's alone to maintain, keyed on this same spec.vms becoming
+		// non-empty (attach/detach §13.8) — do not also stamp it here.
+		//
 		// A missing CsiVolumeInfo on a VM-owned VM is an anomaly to repair,
 		// not a brownfield PVC to skip (attach/detach §4.1.2, §13.1) — so
 		// this creates it rather than looking it up read-only. Only an
