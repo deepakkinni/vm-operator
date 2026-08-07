@@ -360,13 +360,24 @@ func (r *Reconciler) ReconcileNormal(ctx *pkgctx.VolumeContext) error {
 		return nil
 	}
 
-	// For VM-owned-volumes VMs, first reconcile the dependent-persistent
-	// volumes via the CsiVolumeInfo-based path. The batch path below handles
-	// the remaining (independent/non-owned) volumes for the same VM.
-	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes &&
-		vmopv1util.HasVMOwnedVolumesAnnotation(ctx.VM) {
-		if err := r.reconcileOwnedVolumes(ctx); err != nil {
-			return err
+	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes {
+		// A brownfield VM (annotation absent) that is a migration candidate
+		// must have every existing disk landed on the CsiVolumeInfo path
+		// before the triggering attach/detach is processed as VM-owned
+		// (migration §4.1's ordering rule) — so this returns (requeuing)
+		// rather than falling through to the branches below.
+		if isMigrationCandidate(ctx.VM) {
+			return r.reconcileMigration(ctx)
+		}
+
+		// For VM-owned-volumes VMs, first reconcile the dependent-persistent
+		// volumes via the CsiVolumeInfo-based path. The batch path below
+		// handles the remaining (independent/non-owned) volumes for the
+		// same VM.
+		if vmopv1util.HasVMOwnedVolumesAnnotation(ctx.VM) {
+			if err := r.reconcileOwnedVolumes(ctx); err != nil {
+				return err
+			}
 		}
 	}
 

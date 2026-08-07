@@ -136,4 +136,17 @@ type VirtualMachineProviderInterface interface {
 	// suffixes) so it is directly usable for CNS registerDisk. Must be called
 	// BEFORE DeleteSnapshot while the snapshot config is still accessible.
 	GetDiskPathFromSnapshot(ctx context.Context, vm *vmopv1.VirtualMachine, snapshotName, diskUUID string) (string, error)
+
+	// HasAnySnapshot reports whether the VM has any vSphere snapshot,
+	// managed or unmanaged. Used as the migration §4.5 precheck before a VKS
+	// node's disk-mode conversion, which the host refuses VM-wide when any
+	// snapshot is present.
+	HasAnySnapshot(ctx context.Context, vm *vmopv1.VirtualMachine) (bool, error)
+
+	// ConvertDiskToIndependentPersistent reconfigures the virtual disk at the
+	// given controller slot to VirtualDiskMode independent_persistent. This
+	// edits an existing device in place — no add, no vDiskId, no CBT
+	// directive (migration §4.5) — and must never be combined with a
+	// VM-level changeTrackingEnabled change (attach/detach §5.6).
+	ConvertDiskToIndependentPersistent(ctx context.Context, vm *vmopv1.VirtualMachine, controllerType vmopv1.VirtualControllerType, controllerBusNumber, unitNumber int32) error
 }
