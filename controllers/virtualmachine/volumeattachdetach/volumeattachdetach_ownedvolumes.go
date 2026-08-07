@@ -169,7 +169,13 @@ func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error
 		if !plan.Dependent {
 			// Independent-mode readiness and device attach land in a later
 			// change — see the function doc comment. The entry is on the
-			// CVI; the device add itself is not yet implemented.
+			// CVI; the device add itself is not yet implemented. Whichever
+			// change adds it must write vm.status.volumes directly with
+			// Type: Managed, the same as attachReadyDisks does below — an
+			// independent disk is still an FCD (di.FCD is true), and
+			// updateVolumeStatus's generic scan never creates a fresh status
+			// entry for an FCD it doesn't already know about (attach/detach
+			// V10 item 1), so nothing else will do it.
 			ctx.Logger.Info("Independent-mode VM-owned volume entry present; device attach pending",
 				"pvc", claimName, "cvi", cvi.Name)
 			needRequeue = true

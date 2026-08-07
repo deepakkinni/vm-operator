@@ -3703,6 +3703,117 @@ var _ = Describe("Reconcile", func() {
 					Expect(crv.Spec.PvcName).To(Equal("regular-pvc"))
 				})
 			})
+
+			When("the disk is a migrated VM-owned dependent disk with a real bound PVC", func() {
+				// A clean-migrated dependent disk is, by hardware shape alone,
+				// a non-FCD disk with a PVC-backed spec.volumes entry —
+				// identical to an unmanaged classic disk awaiting a
+				// registration placeholder. The provenance discriminator
+				// (filterOutManagedPVCDisks) is what tells them apart: this
+				// PVC is a real, CSI-managed PVC, not a placeholder this
+				// plugin created, so it must never be treated as an
+				// unmanaged-registration candidate (attach/detach V10 item 3;
+				// migration §13.3 produces this shape in bulk).
+				const (
+					migratedDiskUUID     = "migrated-disk-uuid-1"
+					migratedDiskFileName = "[LocalDS_0] vm1/migrated-disk.vmdk"
+					migratedPVCName      = "migrated-pvc"
+				)
+
+				BeforeEach(func() {
+					pkgcfg.SetContext(ctx, func(config *pkgcfg.Config) {
+						config.Features.VMOwnedVolumes = true
+					})
+
+					vm.Spec.Volumes = []vmopv1.VirtualMachineVolume{
+						{
+							Name: "migrated-volume",
+							VirtualMachineVolumeSource: vmopv1.VirtualMachineVolumeSource{
+								PersistentVolumeClaim: &vmopv1.PersistentVolumeClaimVolumeSource{
+									PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+										ClaimName: migratedPVCName,
+									},
+								},
+							},
+							ControllerType:      vmopv1.VirtualControllerTypeIDE,
+							ControllerBusNumber: ptr.To(int32(0)),
+							UnitNumber:          ptr.To(int32(0)),
+						},
+					}
+
+					// A real, CSI-managed, already-bound PVC: no
+					// dataSourceRef pointing at this VM, unlike the
+					// registration placeholder ensurePVCForUnmanagedDisk
+					// would create.
+					boundPVC := &corev1.PersistentVolumeClaim{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      migratedPVCName,
+							Namespace: vm.Namespace,
+						},
+						Spec: corev1.PersistentVolumeClaimSpec{
+							VolumeName:  "migrated-pv",
+							AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+							Resources: corev1.VolumeResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceStorage: *kubeutil.BytesToResource(1024 * 1024 * 1024),
+								},
+							},
+						},
+						Status: corev1.PersistentVolumeClaimStatus{
+							Phase: corev1.ClaimBound,
+						},
+					}
+					withObjs = append(withObjs, boundPVC)
+
+					migratedDisk := &vimtypes.VirtualDisk{
+						VirtualDevice: vimtypes.VirtualDevice{
+							Key:           300,
+							ControllerKey: 100,
+							UnitNumber:    ptr.To(int32(0)),
+							Backing: &vimtypes.VirtualDiskFlatVer2BackingInfo{
+								VirtualDeviceFileBackingInfo: vimtypes.VirtualDeviceFileBackingInfo{
+									FileName: migratedDiskFileName,
+								},
+								Uuid: migratedDiskUUID,
+							},
+						},
+						CapacityInBytes: 1024 * 1024 * 1024,
+						// No VDiskId: the FCD was unregistered during
+						// migration's ownership transfer, so this is a plain
+						// VMDK.
+					}
+
+					ideController := &vimtypes.VirtualIDEController{
+						VirtualController: vimtypes.VirtualController{
+							VirtualDevice: vimtypes.VirtualDevice{
+								Key: 100,
+							},
+							BusNumber: 0,
+						},
+					}
+
+					moVM.Config = &vimtypes.VirtualMachineConfigInfo{
+						Hardware: vimtypes.VirtualHardware{
+							Device: []vimtypes.BaseVirtualDevice{
+								ideController,
+								migratedDisk,
+							},
+						},
+					}
+				})
+
+				It("does not register the disk as unmanaged", func() {
+					Expect(unmanagedvolsreg.Reconcile(ctx, k8sClient, vimClient, vm, moVM, configSpec)).
+						ToNot(HaveOccurred())
+
+					crv := &cnsv1alpha1.CnsRegisterVolume{}
+					err := k8sClient.Get(ctx, ctrlclient.ObjectKey{
+						Namespace: vm.Namespace,
+						Name:      migratedPVCName,
+					}, crv)
+					Expect(apierrors.IsNotFound(err)).To(BeTrue())
+				})
+			})
 		})
 	})
 })
