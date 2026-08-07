@@ -103,6 +103,18 @@ func IsDependentMode(dm cnsv1alpha1.CVIDiskMode) bool {
 	return dm == "" || dm == cnsv1alpha1.CVIDiskModePersistent
 }
 
+// NormalizeDiskMode maps an empty CsiVolumeInfo disk mode to Persistent,
+// matching the vm.spec default (VirtualMachineRef.DiskMode's documented
+// convention). Use this before comparing an existing entry's DiskMode
+// against a freshly computed one — otherwise an entry written before this
+// field existed compares as different from the volume it already matches.
+func NormalizeDiskMode(dm cnsv1alpha1.CVIDiskMode) cnsv1alpha1.CVIDiskMode {
+	if dm == "" {
+		return cnsv1alpha1.CVIDiskModePersistent
+	}
+	return dm
+}
+
 // IsFcdRetained reports whether the CsiVolumeInfo carries the fcd-retained
 // annotation: a VMManaged volume whose FCD could not be unregistered because
 // an in-place unregister was blocked (attach/detach §7.3 A.5).

@@ -399,18 +399,26 @@ func (r *Reconciler) ReconcileNormal(ctx *pkgctx.VolumeContext) error {
 	}
 
 	// Process volumes and create/update batch attachment.
-	// Skip batch processing only for VM-owned-volumes VMs that have no
-	// independent volumes to manage and no existing attachment to clean up.
-	// For all other VMs (including those with legacy attachments only) an
-	// empty CnsNodeVMBatchAttachment is created intentionally to signal CSI.
+	// A VM-owned-volumes VM never gets a batch attachment (attach/detach
+	// §2.7): every mode is on the CsiVolumeInfo path, so
+	// volumeSpecsForBatch is always empty for such a VM. For all other VMs
+	// (including those with legacy attachments only) an empty
+	// CnsNodeVMBatchAttachment is created intentionally to signal CSI.
 	var (
 		filteredVolumeSpecsForBatch []cnsv1alpha1.VolumeSpec
 		processErr                  error
 	)
 	skipBatch := pkgcfg.FromContext(ctx).Features.VMOwnedVolumes &&
-		vmopv1util.HasVMOwnedVolumesAnnotation(ctx.VM) &&
-		len(volumeSpecsForBatch) == 0 &&
-		batchAttachment == nil
+		vmopv1util.HasVMOwnedVolumesAnnotation(ctx.VM)
+	if skipBatch && batchAttachment != nil {
+		// A batch attachment can only appear here through migration (which
+		// freezes it before this path ever sees it) or a downgrade. Either
+		// way it is not this path's to touch — removing a volume from an
+		// existing batch attachment detaches a live FCD (migration §12), so
+		// only the migration retire path may delete it.
+		ctx.Logger.Info("VM-owned-volumes VM has an existing CnsNodeVMBatchAttachment; leaving it for the migration retire path",
+			"batchAttachment", batchAttachment.Name)
+	}
 	if !skipBatch {
 		filteredVolumeSpecsForBatch, processErr = r.processBatchAttachmentAndFilterVolumeSpecs(
 			ctx,
@@ -448,14 +456,14 @@ func (r *Reconciler) ReconcileNormal(ctx *pkgctx.VolumeContext) error {
 	)
 
 	// Collect the spec-volume names whose status entries are owned by the
-	// CsiVolumeInfo path so updateVMVolumeStatus can preserve them.
-	// These are the dependent-persistent volumes on VM-owned-volumes VMs —
-	// the same set excluded from the batch path by categorizeVolumeSpecs.
+	// CsiVolumeInfo path so updateVMVolumeStatus can preserve them. This is
+	// every PVC-backed volume on a VM-owned-volumes VM — the same set
+	// excluded from the batch path by categorizeVolumeSpecs.
 	ownedVolumeNames := make(map[string]struct{})
 	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes &&
 		vmopv1util.HasVMOwnedVolumesAnnotation(ctx.VM) {
 		for _, vol := range ctx.VM.Spec.Volumes {
-			if vol.PersistentVolumeClaim != nil && vmopv1util.IsDependentMode(vmopv1util.DiskModeForVolume(vol)) {
+			if vol.PersistentVolumeClaim != nil {
 				ownedVolumeNames[vol.Name] = struct{}{}
 			}
 		}
@@ -1361,9 +1369,12 @@ func categorizeVolumeSpecs(
 	// by legacy CnsNodeVmAttachment
 	volumeSpecsForBatch := []vmopv1.VirtualMachineVolume{}
 	volumeSpecsForLegacy := []vmopv1.VirtualMachineVolume{}
-	// isOwnedVM is true when the CVI/VMManaged path is active for this VM.
-	// Dependent-persistent volumes on such VMs are reconciled by
-	// reconcileOwnedVolumes, not by the batch attachment path.
+	// isOwnedVM is true when the CVI/VMManaged path is active for this VM. On
+	// such a VM every PVC-backed disk, in every mode, is reconciled by
+	// reconcileOwnedVolumes — the batch attachment plays no role at all
+	// (attach/detach §2.7). Disk mode selects the ownership *behavior*
+	// (transfer vs. keep the FCD registered), not which mechanism handles
+	// the volume.
 	isOwnedVM := pkgcfg.FromContext(ctx).Features.VMOwnedVolumes &&
 		vmopv1util.HasVMOwnedVolumesAnnotation(ctx.VM)
 
@@ -1372,9 +1383,9 @@ func categorizeVolumeSpecs(
 			continue
 		}
 
-		// Dependent-persistent volumes on VM-owned-volumes VMs are handled
-		// exclusively by the CsiVolumeInfo path — exclude them from batch.
-		if isOwnedVM && vmopv1util.IsDependentMode(vmopv1util.DiskModeForVolume(vol)) {
+		// Every PVC-backed volume on a VM-owned-volumes VM is handled
+		// exclusively by the CsiVolumeInfo path — exclude it from batch.
+		if isOwnedVM {
 			continue
 		}
 

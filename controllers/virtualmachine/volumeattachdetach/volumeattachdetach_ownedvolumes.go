@@ -18,6 +18,7 @@ import (
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
 	pkgerr "github.com/vmware-tanzu/vm-operator/pkg/errors"
 	vmopv1util "github.com/vmware-tanzu/vm-operator/pkg/util/vmopv1"
+	"github.com/vmware-tanzu/vm-operator/pkg/volumes/owned"
 )
 
 // reconcileOwnedVolumes reconciles CsiVolumeInfo-based volume attach/detach
@@ -64,13 +65,15 @@ func (r *Reconciler) reconcileOwnedVolumes(ctx *pkgctx.VolumeContext) error {
 
 // reconcileOwnedVolumeAttach processes Workflow A: for each volume in spec.volumes
 // that does not yet appear in status.volumes with an attached disk, write the
-// VM entry to the CsiVolumeInfo spec.vms and, once CSI signals green, attach
-// the disk directly to the VM via ReconfigVM.
+// VM entry to the CsiVolumeInfo spec.vms and, once ready, attach the disk
+// directly to the VM via ReconfigVM.
 //
-// All dependent-persistent volumes are processed in a single pass. Volumes
-// whose CVI is not yet ready (entry just patched, or green signal absent) set
-// needRequeue and continue — they do not block later volumes that are ready.
-// A single RequeueError is returned at the end if any volume is still pending.
+// Every PVC-backed volume on a VM-owned VM is processed in a single pass,
+// regardless of disk mode (attach/detach §2.7) — disk mode only selects the
+// ownership behavior. Volumes whose CVI is not yet ready (entry just
+// patched, or a dependent volume's green signal absent) set needRequeue and
+// continue — they do not block later volumes that are ready. A single
+// RequeueError is returned at the end if any volume is still pending.
 func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error {
 
 	vm := ctx.VM
@@ -85,22 +88,13 @@ func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error
 
 	needRequeue := false
 
-	for _, vol := range vm.Spec.Volumes {
-		if vol.PersistentVolumeClaim == nil {
-			continue
-		}
-
-		// Only dependent-persistent mode uses the VM-owned path.
-		if !vmopv1util.IsDependentMode(vmopv1util.DiskModeForVolume(vol)) {
-			continue
-		}
-
+	for _, plan := range owned.ClassifyVolumes(vm) {
 		// Already attached — nothing to do.
-		if _, ok := statusVolumeNames[vol.Name]; ok {
+		if _, ok := statusVolumeNames[plan.VolumeName]; ok {
 			continue
 		}
 
-		claimName := vol.PersistentVolumeClaim.ClaimName
+		claimName := plan.ClaimName
 
 		cvi, err := vmopv1util.GetCVIForPVC(ctx, r.Client, vm.Namespace, claimName)
 		if err != nil {
@@ -113,19 +107,39 @@ func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error
 			return fmt.Errorf("failed to get CsiVolumeInfo for PVC %s: %w", claimName, err)
 		}
 
-		if vmopv1util.VMEntry(cvi, vm.Name) == nil {
-			// Append this VM to spec.vms and patch. CSI will react and update
-			// status (ownership transfer / green signal). Continue processing
-			// remaining volumes — other CVIs are independent.
+		entry := vmopv1util.VMEntry(cvi, vm.Name)
+		if entry == nil || vmopv1util.NormalizeDiskMode(entry.DiskMode) != plan.DiskMode {
+			// Append or update this VM's entry and patch. An already-present
+			// entry whose DiskMode differs is updated in place — this is what
+			// makes a VKS disk-mode conversion (V12) converge.
 			patch := ctrlclient.MergeFrom(cvi.DeepCopy())
-			cvi.Spec.VMs = append(cvi.Spec.VMs, cnsv1alpha1.VirtualMachineRef{
-				VMName:         vm.Name,
-				VMInstanceUUID: vm.Status.InstanceUUID,
-			})
+			if entry == nil {
+				cvi.Spec.VMs = append(cvi.Spec.VMs, cnsv1alpha1.VirtualMachineRef{
+					VMName:         vm.Name,
+					VMInstanceUUID: vm.Status.InstanceUUID,
+					DiskMode:       plan.DiskMode,
+				})
+			} else {
+				for i := range cvi.Spec.VMs {
+					if cvi.Spec.VMs[i].VMName == vm.Name {
+						cvi.Spec.VMs[i].DiskMode = plan.DiskMode
+					}
+				}
+			}
 			if err := r.Client.Patch(ctx, cvi, patch); err != nil {
 				return fmt.Errorf("failed to patch CsiVolumeInfo spec.vms for PVC %s: %w", claimName, err)
 			}
-			ctx.Logger.Info("Appended VM entry to CsiVolumeInfo spec.vms for attach",
+			ctx.Logger.Info("Wrote VM entry to CsiVolumeInfo spec.vms for attach",
+				"pvc", claimName, "cvi", cvi.Name, "diskMode", plan.DiskMode)
+			needRequeue = true
+			continue
+		}
+
+		if !plan.Dependent {
+			// Independent-mode readiness and device attach (backing
+			// resolution, vDiskId, per-disk CBT) land in V3/V4. The entry is
+			// on the CVI; the device add itself is not yet implemented.
+			ctx.Logger.Info("Independent-mode VM-owned volume entry present; device attach pending",
 				"pvc", claimName, "cvi", cvi.Name)
 			needRequeue = true
 			continue
@@ -160,7 +174,7 @@ func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error
 		// every PVC-backed volume, so setting it here unblocks the first
 		// power-on after attach.
 		vm.Status.Volumes = append(vm.Status.Volumes, vmopv1.VirtualMachineVolumeStatus{
-			Name:     vol.Name,
+			Name:     plan.VolumeName,
 			Type:     vmopv1.VolumeTypeManaged,
 			DiskUUID: cvi.Spec.DiskUUID,
 			Attached: true,

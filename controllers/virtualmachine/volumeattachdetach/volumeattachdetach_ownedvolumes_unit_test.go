@@ -337,10 +337,22 @@ var _ = Describe(
 							}
 						})
 
-						It("skips the volume — no status entry added", func() {
+						It("routes the volume onto the CVI path — entry written, no status entry yet", func() {
 							err := reconciler.ReconcileNormal(volCtx)
-							Expect(err).ToNot(HaveOccurred())
+
+							var requeue pkgerr.RequeueError
+							Expect(errors.As(err, &requeue)).To(BeTrue(),
+								"requeues while device attach is pending (V3/V4), got: %v", err)
 							Expect(vm.Status.Volumes).To(BeEmpty())
+
+							cvi := &cnsv1alpha1.CsiVolumeInfo{}
+							Expect(ctx.Client.Get(ctx, client.ObjectKey{
+								Name:      vmopv1util.CVINameForVolumeID(volID),
+								Namespace: cnsv1alpha1.CVINamespace,
+							}, cvi)).To(Succeed())
+							entry := vmopv1util.VMEntry(cvi, vmName)
+							Expect(entry).NotTo(BeNil())
+							Expect(entry.DiskMode).To(Equal(cnsv1alpha1.CVIDiskModeIndependentPersistent))
 						})
 					})
 
@@ -364,10 +376,22 @@ var _ = Describe(
 							}
 						})
 
-						It("skips the volume — no status entry added", func() {
+						It("routes the volume onto the CVI path — entry written, no status entry yet", func() {
 							err := reconciler.ReconcileNormal(volCtx)
-							Expect(err).ToNot(HaveOccurred())
+
+							var requeue pkgerr.RequeueError
+							Expect(errors.As(err, &requeue)).To(BeTrue(),
+								"requeues while device attach is pending (V3/V4), got: %v", err)
 							Expect(vm.Status.Volumes).To(BeEmpty())
+
+							cvi := &cnsv1alpha1.CsiVolumeInfo{}
+							Expect(ctx.Client.Get(ctx, client.ObjectKey{
+								Name:      vmopv1util.CVINameForVolumeID(volID),
+								Namespace: cnsv1alpha1.CVINamespace,
+							}, cvi)).To(Succeed())
+							entry := vmopv1util.VMEntry(cvi, vmName)
+							Expect(entry).NotTo(BeNil())
+							Expect(entry.DiskMode).To(Equal(cnsv1alpha1.CVIDiskModeNonPersistent))
 						})
 					})
 
