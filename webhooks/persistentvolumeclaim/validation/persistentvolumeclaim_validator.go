@@ -37,7 +37,7 @@ const (
 	vmAttachedPVCDeleteDeniedFmt = "cannot delete PVC %s: volume is attached to a VM-owned VM; detach it first"
 )
 
-// +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get
+// +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=cns.vmware.com,resources=csivolumeinfos,verbs=get
 
 var (

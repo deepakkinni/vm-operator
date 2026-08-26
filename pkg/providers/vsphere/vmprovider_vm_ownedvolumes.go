@@ -492,6 +492,10 @@ func findVirtualDiskAtSlot(
 // findVirtualDiskDeviceAtSlot locates the VirtualDisk device in the moVM
 // device list that is attached to the controller identified by
 // controllerType, controllerBusNumber, and unitNumber.
+//
+// If the slot holds no disk — or the controller itself is absent — the
+// returned error wraps providers.ErrDiskNotFoundAtSlot so callers can tell
+// an empty slot from a genuine failure.
 func findVirtualDiskDeviceAtSlot(
 	moVM *mo.VirtualMachine,
 	controllerType vmopv1.VirtualControllerType,
@@ -544,7 +548,12 @@ func findVirtualDiskDeviceAtSlot(
 	}
 
 	if !found {
-		return nil, fmt.Errorf("controller not found: type=%s busNumber=%d", controllerType, controllerBusNumber)
+		// Wrapped in ErrDiskNotFoundAtSlot: a missing controller is the same
+		// class of absence as a missing disk — a snapshot revert can drop the
+		// whole controller along with the disks that hung off it — and callers
+		// must handle both the same way.
+		return nil, fmt.Errorf("%w: controller not found: type=%s busNumber=%d",
+			providers.ErrDiskNotFoundAtSlot, controllerType, controllerBusNumber)
 	}
 
 	// Find the VirtualDisk with the matching controller key and unit number.
@@ -564,7 +573,8 @@ func findVirtualDiskDeviceAtSlot(
 		return disk, nil
 	}
 
-	return nil, fmt.Errorf("virtual disk not found at slot: controllerKey=%d unitNumber=%d", controllerKey, unitNumber)
+	return nil, fmt.Errorf("%w: controllerKey=%d unitNumber=%d",
+		providers.ErrDiskNotFoundAtSlot, controllerKey, unitNumber)
 }
 
 // rootBackingFileName walks the backing's Parent chain to the root ancestor —

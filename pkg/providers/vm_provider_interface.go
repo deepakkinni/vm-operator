@@ -31,6 +31,19 @@ var (
 	// CreateOrUpdateVirtualMachine and DeleteVirtualMachine functions when
 	// the VM is still being reconciled in a background thread.
 	ErrReconcileInProgress = errors.New("reconcile already in progress")
+
+	// ErrDiskNotFoundAtSlot is returned from the slot-addressed disk
+	// functions — DetachDiskAtSlot, GetLiveDiskPathAtSlot — when the live VM
+	// carries no virtual disk at the requested slot, either because no disk
+	// occupies the unit number or because the controller itself is absent.
+	//
+	// This is an expected outcome, not a failure: a snapshot revert removes
+	// any disk added after the snapshot was taken, while the status entry
+	// naming its slot survives (status.volumes for managed volumes tracks
+	// attachment state, not live hardware). Callers must distinguish this
+	// case from a genuine vCenter error and treat the disk as already
+	// detached.
+	ErrDiskNotFoundAtSlot = errors.New("virtual disk not found at slot")
 )
 
 type VMGroupPlacement struct {
@@ -96,7 +109,8 @@ type VirtualMachineProviderInterface interface {
 	// DetachDiskAtSlot removes the virtual disk at the given SCSI/controller
 	// slot from the virtual machine without deleting the underlying VMDK file.
 	// The slot is identified by controllerType, controllerBusNumber, and
-	// unitNumber as recorded in vm.status.volumes.
+	// unitNumber as recorded in vm.status.volumes. Returns an error wrapping
+	// ErrDiskNotFoundAtSlot if the slot holds no disk.
 	DetachDiskAtSlot(ctx context.Context, vm *vmopv1.VirtualMachine, controllerType vmopv1.VirtualControllerType, controllerBusNumber, unitNumber int32) (diskPath string, retErr error)
 
 	// AttachVolumeDisks adds each of the given disks to the VM in a single
@@ -120,7 +134,8 @@ type VirtualMachineProviderInterface interface {
 	// GetLiveDiskPathAtSlot returns the current, non-base-walked datastore
 	// path of the virtual disk at the given controller slot, without
 	// modifying the VM. Used to refresh CsiVolumeInfo.spec.diskPath before a
-	// detach removes the device (attach/detach §8.2 B.2).
+	// detach removes the device (attach/detach §8.2 B.2). Returns an error
+	// wrapping ErrDiskNotFoundAtSlot if the slot holds no disk.
 	GetLiveDiskPathAtSlot(ctx context.Context, vm *vmopv1.VirtualMachine, controllerType vmopv1.VirtualControllerType, controllerBusNumber, unitNumber int32) (string, error)
 
 	// IsDiskRetainedByAnySnapshot queries the live vCenter snapshot tree for the

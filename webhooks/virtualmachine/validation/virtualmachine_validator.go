@@ -161,7 +161,7 @@ var (
 // +kubebuilder:rbac:groups=vmoperator.vmware.com,resources=virtualmachines,verbs=get;list
 // +kubebuilder:rbac:groups=vmoperator.vmware.com,resources=virtualmachines/status,verbs=get
 // +kubebuilder:rbac:groups=netoperator.vmware.com,resources=networksettings,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get
+// +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=cns.vmware.com,resources=csivolumeinfos,verbs=get
 
 // AddToManager adds the webhook to the provided manager.

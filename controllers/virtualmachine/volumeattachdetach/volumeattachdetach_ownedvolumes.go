@@ -5,9 +5,11 @@
 package volumeattachdetach
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -70,7 +72,7 @@ type readyDependentDisk struct {
 	plan     owned.VolumePlan
 	diskPath string
 	diskUUID string // spec.diskUUID, informational (§4.2.2); "" when fcd-retained
-	fcdID    string // set iff the disk is still a registered FCD (fcd-retained)
+	fcdID    string // set iff the disk is a still-registered, linked-clone FCD
 }
 
 // reconcileOwnedVolumeAttach processes Workflow A: for each volume in spec.volumes
@@ -205,13 +207,25 @@ func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error
 			diskUUID: cvi.Spec.DiskUUID,
 		}
 		if vmopv1util.IsFcdRetained(cvi) {
-			// The FCD was never unregistered — it is still an FCD identity
-			// vpxd can use for its linked-clone precheck (attach/detach
-			// §7.1.5). CBT-per-disk does not apply here: §7.1.4 reserves
-			// that directive for independent disks, and the platform's
-			// default already produces the correct row for a dependent
-			// fcd-retained disk.
-			rd.fcdID = cvi.Spec.VolumeID
+			// vDiskId is supplied only for a linked-clone retained FCD —
+			// the one case vpxd's LinkedCloneFcdAttachPrechecks needs the
+			// FCD identity for (attach/detach §7.1.5). Setting it
+			// unconditionally for every fcd-retained disk also routes the
+			// reconfigure through vpxd's unrelated VSLM
+			// reconfigure-precheck callback, which mishandles the
+			// datastore path for a snapshot-blocked retained FCD
+			// ("Invalid datastore path"), so it must stay scoped to the
+			// linked-clone case. CBT-per-disk does not apply here: §7.1.4
+			// reserves that directive for independent disks, and the
+			// platform's default already produces the correct row for a
+			// dependent fcd-retained disk.
+			pvc := &corev1.PersistentVolumeClaim{}
+			if err := r.Client.Get(ctx, ctrlclient.ObjectKey{Namespace: vm.Namespace, Name: claimName}, pvc); err != nil {
+				return fmt.Errorf("failed to get PVC %s to check linked-clone annotation: %w", claimName, err)
+			}
+			if vmopv1util.IsLinkedClonePVC(pvc) {
+				rd.fcdID = cvi.Spec.VolumeID
+			}
 		}
 		ready = append(ready, rd)
 	}
@@ -363,6 +377,17 @@ func (r *Reconciler) reconcileOwnedVolumeDetach(
 // never observed — no ReconfigVM is issued; the volume falls through to the
 // same disk-not-on-VM handling as a disk that was already removed
 // out-of-band.
+//
+// The converse also holds: a status entry can name a slot the live VM no
+// longer fills. A snapshot revert removes any disk added after the snapshot
+// was taken, but leaves the status entry behind, because status.volumes for
+// managed volumes tracks attachment state rather than mirroring hardware —
+// updateVolumeStatus prunes only Classic entries, and updateVMVolumeStatus
+// preserves CVI-owned ones. Both provider slot calls therefore report
+// providers.ErrDiskNotFoundAtSlot as an expected outcome, not an error, and
+// the volume takes the same disk-not-on-VM path. Erroring out instead would
+// deadlock: the stale entry blocks the detach, and only the detach clears
+// the stale entry.
 func (r *Reconciler) detachOwnedVolume(
 	ctx *pkgctx.VolumeContext,
 	cvi *cnsv1alpha1.CsiVolumeInfo) error {
@@ -396,10 +421,15 @@ func (r *Reconciler) detachOwnedVolume(
 			*statusEntry.ControllerBusNumber,
 			*statusEntry.UnitNumber,
 		); err != nil {
-			return fmt.Errorf("failed to detach independent disk for CsiVolumeInfo %s: %w", cvi.Name, err)
+			if !errors.Is(err, providers.ErrDiskNotFoundAtSlot) {
+				return fmt.Errorf("failed to detach independent disk for CsiVolumeInfo %s: %w", cvi.Name, err)
+			}
+			ctx.Logger.Info("Independent VM-owned disk already absent from VM; treating as detached",
+				"cvi", cvi.Name, "pvc", cvi.Spec.PVCName)
+		} else {
+			ctx.Logger.Info("Removed independent VM-owned disk from VM",
+				"cvi", cvi.Name, "pvc", cvi.Spec.PVCName)
 		}
-		ctx.Logger.Info("Removed independent VM-owned disk from VM",
-			"cvi", cvi.Name, "pvc", cvi.Spec.PVCName)
 
 		return r.removeCVIEntryIfNotRetained(ctx, cvi, statusEntry, false)
 	}
@@ -417,7 +447,26 @@ func (r *Reconciler) detachOwnedVolume(
 		*statusEntry.UnitNumber,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to read live disk path for CsiVolumeInfo %s: %w", cvi.Name, err)
+		if !errors.Is(err, providers.ErrDiskNotFoundAtSlot) {
+			return fmt.Errorf("failed to read live disk path for CsiVolumeInfo %s: %w", cvi.Name, err)
+		}
+
+		// The slot the status entry names holds no disk, so the device is
+		// already off the VM: a snapshot revert dropped a disk added after
+		// the snapshot was taken, leaving the status entry that named its
+		// slot behind. Keep spec.diskPath as it stands — the live VM no
+		// longer carries a path to refresh it from — and issue no
+		// ReconfigVM. Falling through to removeCVIEntryIfNotRetained both
+		// clears the stale status entry and, when no snapshot still retains
+		// the disk, releases the CVI entry so CSI can re-register the
+		// volume.
+		ctx.Logger.Info("VM-owned disk already absent from VM; treating as detached",
+			"cvi", cvi.Name, "pvc", cvi.Spec.PVCName,
+			"controllerType", statusEntry.ControllerType,
+			"controllerBusNumber", *statusEntry.ControllerBusNumber,
+			"unitNumber", *statusEntry.UnitNumber)
+
+		return r.removeCVIEntryIfNotRetained(ctx, cvi, statusEntry, dependent)
 	}
 	if livePath != "" && livePath != cvi.Spec.DiskPath {
 		patch := ctrlclient.MergeFrom(cvi.DeepCopy())
@@ -433,10 +482,16 @@ func (r *Reconciler) detachOwnedVolume(
 		*statusEntry.ControllerBusNumber,
 		*statusEntry.UnitNumber,
 	); err != nil {
-		return fmt.Errorf("failed to detach disk for CsiVolumeInfo %s: %w", cvi.Name, err)
+		// Not-found is tolerated here too: the disk can go away between the
+		// path read above and this remove.
+		if !errors.Is(err, providers.ErrDiskNotFoundAtSlot) {
+			return fmt.Errorf("failed to detach disk for CsiVolumeInfo %s: %w", cvi.Name, err)
+		}
+		ctx.Logger.Info("VM-owned disk went absent before detach; treating as detached",
+			"cvi", cvi.Name, "pvc", cvi.Spec.PVCName)
+	} else {
+		ctx.Logger.Info("Removed VM-owned disk from VM", "cvi", cvi.Name, "pvc", cvi.Spec.PVCName)
 	}
-
-	ctx.Logger.Info("Removed VM-owned disk from VM", "cvi", cvi.Name, "pvc", cvi.Spec.PVCName)
 
 	return r.removeCVIEntryIfNotRetained(ctx, cvi, statusEntry, dependent)
 }

@@ -300,6 +300,17 @@ func IsFcdRetained(cvi *cnsv1alpha1.CsiVolumeInfo) bool {
 	return metav1.HasAnnotation(cvi.ObjectMeta, cnsv1alpha1.FcdRetainedAnnotation)
 }
 
+// IsLinkedClonePVC reports whether the PVC is a linked-clone
+// ("fast provisioning") volume. vDiskId is supplied on the attach
+// device-add only for this case: it is the one still-FCD scenario vpxd's
+// LinkedCloneFcdAttachPrechecks needs the FCD identity for (attach/detach
+// §7.1.1, §7.1.5). Setting it for any other still-FCD disk (CBT- or
+// snapshot-blocked fcd-retained) buys nothing and additionally routes the
+// reconfigure through vpxd's unrelated VSLM reconfigure-precheck callback.
+func IsLinkedClonePVC(pvc *corev1.PersistentVolumeClaim) bool {
+	return pvc.Annotations[pkgconst.PVCFastProvisioningAnnotation] == "true"
+}
+
 // IsGreenSignal reports whether the CsiVolumeInfo status has the green signal
 // that permits vm-operator to add the disk to the VM.
 // Green signal = status.ownership==VMManaged && status.phase==Succeeded

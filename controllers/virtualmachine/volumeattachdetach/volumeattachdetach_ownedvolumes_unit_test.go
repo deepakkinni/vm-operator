@@ -7,6 +7,7 @@ package volumeattachdetach_test
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -416,6 +417,121 @@ var _ = Describe(
 						})
 					})
 
+					// A snapshot revert drops any disk added after the snapshot
+					// was taken, but leaves behind the status entry naming its
+					// slot. The detach must treat the absent device as already
+					// detached instead of erroring, or the stale entry and the
+					// detach that would clear it deadlock on each other.
+					When("the status entry names a slot the live VM no longer fills", func() {
+						const (
+							detachPVC   = "detached-pvc-reverted"
+							detachVolID = "vol-detach-reverted"
+						)
+
+						busNumber := int32(0)
+						unitNumber := int32(3)
+
+						getCVI := func() *cnsv1alpha1.CsiVolumeInfo {
+							cvi := &cnsv1alpha1.CsiVolumeInfo{}
+							Expect(ctx.Client.Get(ctx, client.ObjectKey{
+								Name:      vmopv1util.CVINameForVolumeID(detachVolID),
+								Namespace: cnsv1alpha1.CVINamespace,
+							}, cvi)).To(Succeed())
+							return cvi
+						}
+
+						notFound := func(
+							_ context.Context, _ *vmopv1.VirtualMachine, _ vmopv1.VirtualControllerType,
+							controllerBusNumber, unitNumber int32,
+						) (string, error) {
+							return "", fmt.Errorf("failed to find virtual disk at slot: %w: controllerKey=1000 unitNumber=%d",
+								providers.ErrDiskNotFoundAtSlot, unitNumber)
+						}
+
+						BeforeEach(func() {
+							vm.Spec.Volumes = nil
+							vm.Status.Volumes = []vmopv1.VirtualMachineVolumeStatus{
+								{
+									Name:                "vol-detach-reverted",
+									Type:                vmopv1.VolumeTypeManaged,
+									DiskUUID:            "disk-uuid-detach-reverted",
+									Attached:            true,
+									ControllerType:      vmopv1.VirtualControllerTypeSCSI,
+									ControllerBusNumber: &busNumber,
+									UnitNumber:          &unitNumber,
+								},
+							}
+							cvi := &cnsv1alpha1.CsiVolumeInfo{
+								ObjectMeta: metav1.ObjectMeta{
+									Name:      vmopv1util.CVINameForVolumeID(detachVolID),
+									Namespace: cnsv1alpha1.CVINamespace,
+								},
+								Spec: cnsv1alpha1.CsiVolumeInfoSpec{
+									VolumeID:     detachVolID,
+									PVCName:      detachPVC,
+									PVCNamespace: ns,
+									DiskUUID:     "disk-uuid-detach-reverted",
+									DiskPath:     "[ds1] reverted-path.vmdk",
+									VMs: []cnsv1alpha1.VirtualMachineRef{
+										{VMName: vmName, VolumeName: "vol-detach-reverted"},
+									},
+								},
+								Status: cnsv1alpha1.CsiVolumeInfoStatus{
+									Ownership: cnsv1alpha1.OwnershipStateVMManaged,
+									Phase:     cnsv1alpha1.PhaseSucceeded,
+								},
+							}
+							initObjects = append(initObjects, cvi)
+						})
+
+						When("no snapshot retains the disk", func() {
+							It("clears the stale status entry and releases the CVI entry without a reconfigure", func() {
+								detachCalled := false
+								ctx.VMProvider.(*providerfake.VMProvider).GetLiveDiskPathAtSlotFn = notFound
+								ctx.VMProvider.(*providerfake.VMProvider).DetachDiskAtSlotFn = func(
+									_ context.Context, _ *vmopv1.VirtualMachine, _ vmopv1.VirtualControllerType, _, _ int32,
+								) (string, error) {
+									detachCalled = true
+									return "", nil
+								}
+								ctx.VMProvider.(*providerfake.VMProvider).IsDiskRetainedByAnySnapshotFn =
+									func(_ context.Context, _ *vmopv1.VirtualMachine, _ string) (bool, error) {
+										return false, nil
+									}
+
+								Expect(reconciler.ReconcileNormal(volCtx)).To(Succeed())
+
+								Expect(detachCalled).To(BeFalse(),
+									"no ReconfigVM may be issued for a device that is already gone")
+
+								cvi := getCVI()
+								Expect(cvi.Spec.DiskPath).To(Equal("[ds1] reverted-path.vmdk"),
+									"diskPath must be left as it stands; there is no live device to read it from")
+								Expect(vmopv1util.VMEntry(cvi, vmName)).To(BeNil())
+								Expect(vm.Status.Volumes).To(BeEmpty())
+							})
+						})
+
+						// The reverted-to state is not the only snapshot: a later
+						// snapshot can still hold the disk, so the CVI entry is a
+						// hold that must survive. Only the status entry goes.
+						When("a snapshot still retains the disk", func() {
+							It("clears the stale status entry but keeps the CVI entry", func() {
+								ctx.VMProvider.(*providerfake.VMProvider).GetLiveDiskPathAtSlotFn = notFound
+								ctx.VMProvider.(*providerfake.VMProvider).IsDiskRetainedByAnySnapshotFn =
+									func(_ context.Context, _ *vmopv1.VirtualMachine, _ string) (bool, error) {
+										return true, nil
+									}
+
+								Expect(reconciler.ReconcileNormal(volCtx)).To(Succeed())
+
+								Expect(vmopv1util.VMEntry(getCVI(), vmName)).ToNot(BeNil(),
+									"a snapshot-retained disk keeps its CVI entry so CSI does not re-register it")
+								Expect(vm.Status.Volumes).To(BeEmpty())
+							})
+						})
+					})
+
 					// Independent detach (§8.5): remove the device and the entry,
 					// done. No diskPath refresh and no retention check — an
 					// independent disk is never in a VM snapshot.
@@ -642,7 +758,62 @@ var _ = Describe(
 							}
 						})
 
-						It("sets FcdID from the CVI's volumeID and takes the observed UUID as authoritative", func() {
+						It("leaves FcdID unset (not a linked clone) and takes the observed UUID as authoritative", func() {
+							var gotDisks []providers.VolumeDiskAddSpec
+							ctx.VMProvider.(*providerfake.VMProvider).AttachVolumeDisksFn = func(
+								_ context.Context, _ *vmopv1.VirtualMachine, disks []providers.VolumeDiskAddSpec,
+							) ([]providers.VolumeDiskPlacement, error) {
+								gotDisks = disks
+								return []providers.VolumeDiskPlacement{
+									{VolumeName: "vol-persistent", DiskUUID: "observed-uuid-from-device"},
+								}, nil
+							}
+
+							err := reconciler.ReconcileNormal(volCtx)
+							Expect(err).ToNot(HaveOccurred())
+
+							Expect(gotDisks).To(HaveLen(1))
+							Expect(gotDisks[0].FcdID).To(BeEmpty(),
+								"FcdID must stay unset for an fcd-retained disk that is not a linked clone, "+
+									"so the device-add does not carry vDiskId")
+
+							Expect(vm.Status.Volumes).To(HaveLen(1))
+							Expect(vm.Status.Volumes[0].DiskUUID).To(Equal("observed-uuid-from-device"),
+								"the observed UUID must be used since spec.diskUUID is empty for fcd-retained")
+						})
+					})
+
+					When("VM has an fcd-retained dependent-persistent linked-clone volume, green and ready", func() {
+						BeforeEach(func() {
+							pvc, pv, cvi := buildPVCWithCVI(pvcName, pvName, volID)
+							cvi.Spec.VMs = []cnsv1alpha1.VirtualMachineRef{
+								{VMName: vmName, VolumeName: "vol-persistent"},
+							}
+							// fcd-retained: spec.diskUUID is never populated (csi.md C4).
+							cvi.Spec.DiskUUID = ""
+							cvi.Annotations = map[string]string{
+								cnsv1alpha1.FcdRetainedAnnotation: "true",
+							}
+							pvc.Annotations = map[string]string{
+								pkgconst.PVCFastProvisioningAnnotation: "true",
+							}
+							initObjects = append(initObjects, pvc, pv, cvi)
+
+							vm.Spec.Volumes = []vmopv1.VirtualMachineVolume{
+								{
+									Name: "vol-persistent",
+									VirtualMachineVolumeSource: vmopv1.VirtualMachineVolumeSource{
+										PersistentVolumeClaim: &vmopv1.PersistentVolumeClaimVolumeSource{
+											PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+												ClaimName: pvcName,
+											},
+										},
+									},
+								},
+							}
+						})
+
+						It("sets FcdID from the CVI's volumeID so vpxd can run its linked-clone precheck", func() {
 							var gotDisks []providers.VolumeDiskAddSpec
 							ctx.VMProvider.(*providerfake.VMProvider).AttachVolumeDisksFn = func(
 								_ context.Context, _ *vmopv1.VirtualMachine, disks []providers.VolumeDiskAddSpec,
@@ -658,11 +829,7 @@ var _ = Describe(
 
 							Expect(gotDisks).To(HaveLen(1))
 							Expect(gotDisks[0].FcdID).To(Equal(volID),
-								"FcdID must be the CVI's volumeID for an fcd-retained disk")
-
-							Expect(vm.Status.Volumes).To(HaveLen(1))
-							Expect(vm.Status.Volumes[0].DiskUUID).To(Equal("observed-uuid-from-device"),
-								"the observed UUID must be used since spec.diskUUID is empty for fcd-retained")
+								"FcdID must be the CVI's volumeID for a linked-clone fcd-retained disk")
 						})
 					})
 

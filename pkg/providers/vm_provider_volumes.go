@@ -26,8 +26,11 @@ type VolumeDiskAddSpec struct {
 	ControllerType      vmopv1.VirtualControllerType
 	ControllerBusNumber *int32
 	UnitNumber          *int32
-	// FcdID is set iff the disk is a still-registered FCD (independent, or
-	// dependent with fcd-retained). Consumed starting in V4.
+	// FcdID is set iff the disk is a still-registered, linked-clone FCD
+	// (dependent fcd-retained today; independent starting in V4). Left
+	// unset for a still-FCD disk that is not a linked clone, so its
+	// device-add does not carry vDiskId and does not route through
+	// vpxd's FCD-identity reconfigure prechecks.
 	FcdID string
 	// CBTEnabled is set iff FcdID is set and the mode is independent.
 	// Consumed starting in V4.

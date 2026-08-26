@@ -24,18 +24,13 @@ rules:
   resources:
   - namespaces
   - nodes
+  - persistentvolumes
   - resourcequotas
   - secrets
   verbs:
   - get
   - list
   - watch
-- apiGroups:
-  - ""
-  resources:
-  - persistentvolumes
-  verbs:
-  - get
 - apiGroups:
   - ""
   resources:

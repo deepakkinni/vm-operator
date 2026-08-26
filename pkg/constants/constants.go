@@ -262,6 +262,11 @@ const (
 	// on a PVC.
 	PVCEncryptionClassNameAnnotation = "csi.vsphere.encryption-class"
 
+	// PVCFastProvisioningAnnotation marks a PVC as a linked-clone
+	// ("fast provisioning") volume, backed by a disk that shares a chain
+	// with its parent FCD.
+	PVCFastProvisioningAnnotation = "csi.vsphere.volume/fast-provisioning"
+
 	// VMOwnedVolumesAnnotation is set on a VirtualMachine at creation time when
 	// the VMOwnedVolumes feature gate is enabled. Its presence identifies the VM
 	// as a VM-owned-volumes VM that uses the CsiVolumeInfo-based volume ownership path
