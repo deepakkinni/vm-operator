@@ -25,6 +25,7 @@ import (
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
 	pkgerr "github.com/vmware-tanzu/vm-operator/pkg/errors"
 	providerfake "github.com/vmware-tanzu/vm-operator/pkg/providers/fake"
+	pkgutil "github.com/vmware-tanzu/vm-operator/pkg/util"
 	"github.com/vmware-tanzu/vm-operator/pkg/util/ptr"
 	vmopv1util "github.com/vmware-tanzu/vm-operator/pkg/util/vmopv1"
 	"github.com/vmware-tanzu/vm-operator/test/builder"
@@ -41,6 +42,15 @@ var _ = Describe(
 			pvName   = "migration-pv"
 			volID    = "migration-vol-id"
 			volName1 = "vol1"
+
+			// A second, pending-attach volume used to give the migration
+			// candidacy check a genuine edge to fire on (migration §4.1):
+			// present in vm.Spec.Volumes but never added to the batch
+			// attachment, so it is the volume that triggers migration while
+			// volName1 is what gets migrated. Per the ordering rule it is
+			// excluded from the migration batch itself.
+			pvcName2 = "migration-pvc-2"
+			volName2 = "vol2"
 		)
 
 		var (
@@ -134,6 +144,23 @@ var _ = Describe(
 			return ba
 		}
 
+		// pendingAttachVolume returns a PVC-backed volume deliberately left
+		// out of any batch attachment/legacy CR fixture, so that including
+		// it in vm.Spec.Volumes is a genuine pending attach -- the edge
+		// isMigrationCandidate now requires (migration §4.1).
+		pendingAttachVolume := func() vmopv1.VirtualMachineVolume {
+			return vmopv1.VirtualMachineVolume{
+				Name: volName2,
+				VirtualMachineVolumeSource: vmopv1.VirtualMachineVolumeSource{
+					PersistentVolumeClaim: &vmopv1.PersistentVolumeClaimVolumeSource{
+						PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+							ClaimName: pvcName2,
+						},
+					},
+				},
+			}
+		}
+
 		getCVI := func() *cnsv1alpha1.CsiVolumeInfo {
 			cvi := &cnsv1alpha1.CsiVolumeInfo{}
 			err := ctx.Client.Get(ctx, client.ObjectKey{
@@ -144,7 +171,7 @@ var _ = Describe(
 			return cvi
 		}
 
-		Context("VM lacks the vm-owned-volumes annotation and has a PVC volume (lazy trigger)", func() {
+		Context("VM lacks the vm-owned-volumes annotation and has a genuine pending attach (lazy, edge-triggered)", func() {
 			BeforeEach(func() {
 				vm.Spec.Volumes = []vmopv1.VirtualMachineVolume{
 					{
@@ -157,6 +184,7 @@ var _ = Describe(
 							},
 						},
 					},
+					pendingAttachVolume(),
 				}
 
 				pvc := &corev1.PersistentVolumeClaim{
@@ -174,7 +202,10 @@ var _ = Describe(
 						},
 					},
 				}
-				ba := cnsBatchAttachmentForVMVolume(vm, vm.Spec.Volumes)
+				// Only volName1 is tracked by the batch attachment -- volName2
+				// (pendingAttachVolume) is what makes this VM a migration
+				// candidate; it must not appear in ba.Spec.Volumes here.
+				ba := cnsBatchAttachmentForVMVolume(vm, vm.Spec.Volumes[:1])
 				ba.Spec.Volumes[0].PersistentVolumeClaim.DiskMode = cnsv1alpha1.Persistent
 
 				initObjects = append(initObjects, pvc, pv, ba)
@@ -244,6 +275,7 @@ var _ = Describe(
 							},
 						},
 					},
+					pendingAttachVolume(),
 				}
 
 				pvc := &corev1.PersistentVolumeClaim{
@@ -261,7 +293,7 @@ var _ = Describe(
 						},
 					},
 				}
-				ba := cnsBatchAttachmentForVMVolume(vm, vm.Spec.Volumes)
+				ba := cnsBatchAttachmentForVMVolume(vm, vm.Spec.Volumes[:1])
 				ba.Spec.Volumes[0].PersistentVolumeClaim.DiskMode = cnsv1alpha1.IndependentPersistent
 
 				initObjects = append(initObjects, pvc, pv, ba)
@@ -329,6 +361,7 @@ var _ = Describe(
 							},
 						},
 					},
+					pendingAttachVolume(),
 				}
 				vm.Status.Volumes = []vmopv1.VirtualMachineVolumeStatus{
 					{
@@ -355,7 +388,7 @@ var _ = Describe(
 						},
 					},
 				}
-				ba := cnsBatchAttachmentForVMVolume(vm, vm.Spec.Volumes)
+				ba := cnsBatchAttachmentForVMVolume(vm, vm.Spec.Volumes[:1])
 				ba.Spec.Volumes[0].PersistentVolumeClaim.DiskMode = cnsv1alpha1.Persistent
 
 				initObjects = append(initObjects, pvc, pv, ba)
@@ -407,6 +440,208 @@ var _ = Describe(
 				// No spec write, no CVI, no annotation flip.
 				Expect(vm.Spec.Volumes[0].DiskMode).To(BeEmpty())
 				Expect(vmopv1util.HasVMOwnedVolumesAnnotation(vm)).To(BeFalse())
+			})
+		})
+
+		Context("VM lacks the vm-owned-volumes annotation but has no pending attach/detach (stable)", func() {
+			BeforeEach(func() {
+				vm.Status.Hardware = &vmopv1.VirtualMachineHardwareStatus{
+					Controllers: []vmopv1.VirtualControllerStatus{
+						{
+							Type:      vmopv1.VirtualControllerTypeSCSI,
+							BusNumber: 0,
+							DeviceKey: 1000,
+						},
+					},
+				}
+				vm.Spec.Volumes = []vmopv1.VirtualMachineVolume{
+					{
+						Name:                volName1,
+						ControllerType:      vmopv1.VirtualControllerTypeSCSI,
+						ControllerBusNumber: ptr.To(int32(0)),
+						UnitNumber:          ptr.To(int32(0)),
+						DiskMode:            vmopv1.VolumeDiskModePersistent,
+						SharingMode:         vmopv1.VolumeSharingModeNone,
+						VirtualMachineVolumeSource: vmopv1.VirtualMachineVolumeSource{
+							PersistentVolumeClaim: &vmopv1.PersistentVolumeClaimVolumeSource{
+								PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: pvcName,
+								},
+							},
+						},
+					},
+				}
+
+				pvc := &corev1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: pvcName, Namespace: ns},
+					Spec: corev1.PersistentVolumeClaimSpec{
+						VolumeName:       pvName,
+						StorageClassName: ptr.To(""),
+					},
+					Status: corev1.PersistentVolumeClaimStatus{
+						Phase: corev1.ClaimBound,
+					},
+				}
+				pv := &corev1.PersistentVolume{
+					ObjectMeta: metav1.ObjectMeta{Name: pvName},
+					Spec: corev1.PersistentVolumeSpec{
+						PersistentVolumeSource: corev1.PersistentVolumeSource{
+							CSI: &corev1.CSIPersistentVolumeSource{VolumeHandle: volID},
+						},
+					},
+				}
+				// The batch attachment already matches vm.Spec.Volumes
+				// exactly -- no pending attach or detach.
+				ba := cnsBatchAttachmentForVMVolume(vm, vm.Spec.Volumes)
+				ba.Spec.Volumes[0].PersistentVolumeClaim.DiskMode = cnsv1alpha1.Persistent
+
+				initObjects = append(initObjects, pvc, pv, ba)
+			})
+
+			It("does not trigger migration, even across repeated reconciles", func() {
+				Expect(reconciler.ReconcileNormal(volCtx)).To(Succeed())
+
+				ba := getBA()
+				Expect(ba).ToNot(BeNil())
+				Expect(ba.Annotations[pkgconst.VMOwnedMigrationAnnotation]).To(BeEmpty())
+				Expect(vmopv1util.HasVMOwnedVolumesAnnotation(vm)).To(BeFalse())
+
+				// A second, identical reconcile must not change anything --
+				// confirms the trigger is edge-based, not re-fired on every
+				// reconcile merely because the VM has a PVC (migration §4.1).
+				Expect(reconciler.ReconcileNormal(volCtx)).To(Succeed())
+				Expect(vmopv1util.HasVMOwnedVolumesAnnotation(vm)).To(BeFalse())
+			})
+		})
+
+		Context("VM has a legacy CnsNodeVmAttachment alongside a pending attach elsewhere", func() {
+			var legacyAttachmentName string
+
+			BeforeEach(func() {
+				legacyAttachmentName = pkgutil.CNSAttachmentNameForVolume(vmName, volName1)
+
+				vm.Spec.Volumes = []vmopv1.VirtualMachineVolume{
+					{
+						Name: volName1,
+						VirtualMachineVolumeSource: vmopv1.VirtualMachineVolumeSource{
+							PersistentVolumeClaim: &vmopv1.PersistentVolumeClaimVolumeSource{
+								PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: pvcName,
+								},
+							},
+						},
+					},
+					pendingAttachVolume(),
+				}
+
+				pvc := &corev1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: pvcName, Namespace: ns},
+					Spec: corev1.PersistentVolumeClaimSpec{
+						VolumeName:       pvName,
+						StorageClassName: ptr.To(""),
+					},
+				}
+				pv := &corev1.PersistentVolume{
+					ObjectMeta: metav1.ObjectMeta{Name: pvName},
+					Spec: corev1.PersistentVolumeSpec{
+						PersistentVolumeSource: corev1.PersistentVolumeSource{
+							CSI: &corev1.CSIPersistentVolumeSource{VolumeHandle: volID},
+						},
+					},
+				}
+				// volName1 predates the VM's move to the batch attachment
+				// mechanism and is still tracked by a legacy
+				// CnsNodeVmAttachment CR, not a BA -- no BA exists at all.
+				// The pending attach of volName2 is still what makes this a
+				// migration candidate (migration §4.1); volName1 is what
+				// gets migrated, via the legacy-CR path.
+				legacyAttachment := &cnsv1alpha1.CnsNodeVmAttachment{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      legacyAttachmentName,
+						Namespace: ns,
+					},
+					Spec: cnsv1alpha1.CnsNodeVmAttachmentSpec{
+						NodeUUID:   vm.Status.BiosUUID,
+						VolumeName: pvcName,
+					},
+					Status: cnsv1alpha1.CnsNodeVmAttachmentStatus{
+						Attached: true,
+						AttachmentMetadata: map[string]string{
+							cnsv1alpha1.AttributeFirstClassDiskUUID: "legacy-disk-uuid",
+						},
+					},
+				}
+
+				initObjects = append(initObjects, pvc, pv, legacyAttachment)
+			})
+
+			It("migrates the legacy-tracked disk and deletes its CnsNodeVmAttachment once VMManaged", func() {
+				err := reconciler.ReconcileNormal(volCtx)
+				Expect(err).To(HaveOccurred())
+				Expect(pkgerr.IsRequeueError(err)).To(BeTrue())
+
+				// CVI written for the legacy-tracked disk; the legacy CR
+				// still exists pending CSI's ownership transfer.
+				cvi := getCVI()
+				entry := vmopv1util.VMEntry(cvi, vmName)
+				Expect(entry).ToNot(BeNil())
+				Expect(entry.DiskMode).To(Equal(cnsv1alpha1.CVIDiskModePersistent))
+				Expect(entry.VolumeName).To(Equal(volName1))
+
+				legacyAttachment := &cnsv1alpha1.CnsNodeVmAttachment{}
+				Expect(ctx.Client.Get(ctx, client.ObjectKey{Name: legacyAttachmentName, Namespace: ns}, legacyAttachment)).To(Succeed())
+
+				// Simulate CSI completing the ownership transfer.
+				cvi.Status.Ownership = cnsv1alpha1.OwnershipStateVMManaged
+				Expect(ctx.Client.Update(ctx, cvi)).To(Succeed())
+
+				err = reconciler.ReconcileNormal(volCtx)
+				Expect(err).ToNot(HaveOccurred())
+
+				Expect(vmopv1util.HasVMOwnedVolumesAnnotation(vm)).To(BeTrue())
+
+				legacyAttachment = &cnsv1alpha1.CnsNodeVmAttachment{}
+				getErr := ctx.Client.Get(ctx, client.ObjectKey{Name: legacyAttachmentName, Namespace: ns}, legacyAttachment)
+				Expect(apierrors.IsNotFound(getErr)).To(BeTrue(), "legacy CnsNodeVmAttachment should be deleted once migrated")
+			})
+		})
+
+		Context("VM's only tracked disk is being detached via a legacy CnsNodeVmAttachment", func() {
+			var legacyAttachmentName string
+
+			BeforeEach(func() {
+				legacyAttachmentName = pkgutil.CNSAttachmentNameForVolume(vmName, volName1)
+
+				// volName1 is NOT in vm.Spec.Volumes -- it is being detached.
+				// That is the pending edge; there is nothing else to migrate.
+				vm.Spec.Volumes = nil
+
+				legacyAttachment := &cnsv1alpha1.CnsNodeVmAttachment{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      legacyAttachmentName,
+						Namespace: ns,
+					},
+					Spec: cnsv1alpha1.CnsNodeVmAttachmentSpec{
+						NodeUUID:   vm.Status.BiosUUID,
+						VolumeName: pvcName,
+					},
+					Status: cnsv1alpha1.CnsNodeVmAttachmentStatus{
+						Attached: true,
+						AttachmentMetadata: map[string]string{
+							cnsv1alpha1.AttributeFirstClassDiskUUID: "legacy-disk-uuid",
+						},
+					},
+				}
+
+				initObjects = append(initObjects, legacyAttachment)
+			})
+
+			It("triggers migration on the detach edge and completes with nothing to migrate", func() {
+				err := reconciler.ReconcileNormal(volCtx)
+				Expect(err).ToNot(HaveOccurred())
+
+				Expect(vmopv1util.HasVMOwnedVolumesAnnotation(vm)).To(BeTrue())
+				Expect(getBA()).To(BeNil())
 			})
 		})
 	},

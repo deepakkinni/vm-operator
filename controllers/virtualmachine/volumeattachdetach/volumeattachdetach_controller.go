@@ -360,14 +360,37 @@ func (r *Reconciler) ReconcileNormal(ctx *pkgctx.VolumeContext) error {
 		return nil
 	}
 
+	legacyAttachments, err := pkgutil.GetCnsNodeVMAttachmentsForVM(ctx, r.Client, ctx.VM)
+	if err != nil {
+		return fmt.Errorf(
+			"error getting existing CnsNodeVmAttachments for VM: %w", err)
+	}
+
+	// Get legacy CnsNodeVmAttachments for this VM. We need to handle
+	// detachments via this resource for the brownfield VMs.
+	attachmentsToDelete := r.attachmentsToDelete(ctx, legacyAttachments)
+
+	volumeSpecsForBatch, volumeSpecsForLegacy := categorizeVolumeSpecs(ctx, legacyAttachments)
+
+	// Get existing batch attachment for this VM.
+	batchAttachment, err := r.getBatchAttachmentForVM(ctx)
+	if err != nil {
+		return fmt.Errorf("error getting existing CnsNodeVMBatchAttachment for VM: %w", err)
+	}
+
 	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes {
 		// A brownfield VM (annotation absent) that is a migration candidate
 		// must have every existing disk landed on the CsiVolumeInfo path
 		// before the triggering attach/detach is processed as VM-owned
 		// (migration §4.1's ordering rule) — so this returns (requeuing)
-		// rather than falling through to the branches below.
-		if isMigrationCandidate(ctx.VM) {
-			return r.reconcileMigration(ctx)
+		// rather than falling through to the branches below. The trigger is
+		// edge-based, not level-triggered on "has a PVC-backed volume": a
+		// non-empty add/remove diff against the batch attachment, or a
+		// legacy attachment slated for deletion, computed from the same
+		// reads used below for ordinary (non-migration) processing.
+		toAdd, toRemove := computeBatchAttachDetachEdge(volumeSpecsForBatch, batchAttachment)
+		if isMigrationCandidate(ctx.VM, toAdd, toRemove, attachmentsToDelete) {
+			return r.reconcileMigration(ctx, batchAttachment, legacyAttachments, volumeSpecsForLegacy, attachmentsToDelete)
 		}
 
 		// For VM-owned-volumes VMs, first reconcile the dependent-persistent
@@ -380,16 +403,6 @@ func (r *Reconciler) ReconcileNormal(ctx *pkgctx.VolumeContext) error {
 			}
 		}
 	}
-
-	legacyAttachments, err := pkgutil.GetCnsNodeVMAttachmentsForVM(ctx, r.Client, ctx.VM)
-	if err != nil {
-		return fmt.Errorf(
-			"error getting existing CnsNodeVmAttachments for VM: %w", err)
-	}
-
-	// Get legacy CnsNodeVmAttachments for this VM. We need to handle
-	// detachments via this resource for the brownfield VMs.
-	attachmentsToDelete := r.attachmentsToDelete(ctx, legacyAttachments)
 
 	// Delete attachments for this VM that exist but are not currently referenced in the Spec.
 	deleteErr := r.deleteOrphanedAttachments(ctx, attachmentsToDelete)
@@ -413,13 +426,6 @@ func (r *Reconciler) ReconcileNormal(ctx *pkgctx.VolumeContext) error {
 		}
 	}
 
-	volumeSpecsForBatch, volumeSpecsForLegacy := categorizeVolumeSpecs(ctx, legacyAttachments)
-
-	// Get existing batch attachment for this VM.
-	batchAttachment, err := r.getBatchAttachmentForVM(ctx)
-	if err != nil {
-		return fmt.Errorf("error getting existing CnsNodeVMBatchAttachment for VM: %w", err)
-	}
 	// Only need to validate the hardware for once during the first time of
 	// creating the batchAttachment.
 	if batchAttachment == nil && len(volumeSpecsForBatch) > 0 {
@@ -559,6 +565,44 @@ func (r *Reconciler) getBatchAttachmentForVM(
 	}
 
 	return attachment, nil
+}
+
+// computeBatchAttachDetachEdge reports whether vmVolumeSpecsForBatch differs
+// from batchAttachment's currently-tracked volumes — i.e. whether a genuine
+// attach or detach is pending for the BA-tracked disks (migration §4.1).
+// This is a coarser, side-effect-free relative of the key-matching logic in
+// processBatchAttachmentAndFilterVolumeSpecs: it does not fetch PVCs or gate
+// on bound state (handlePVCWithWFFC, PVC-bound checks), since for
+// trigger-detection purposes a newly-desired PVC-backed volume already
+// represents a pending attach regardless of whether it has bound yet. It
+// must stay side-effect free — it runs ahead of the migration gate, before
+// this VM has even been determined to need the freeze in §12.1.
+func computeBatchAttachDetachEdge(
+	vmVolumeSpecsForBatch []vmopv1.VirtualMachineVolume,
+	batchAttachment *cnsv1alpha1.CnsNodeVMBatchAttachment,
+) (toAdd, toRemove sets.Set[string]) {
+	existingVolVolKey := sets.New[string]()
+	if batchAttachment != nil {
+		for _, vol := range batchAttachment.Spec.Volumes {
+			existingVolVolKey.Insert(vol.Name + ":" + vol.PersistentVolumeClaim.ClaimName)
+		}
+	}
+
+	toAdd = sets.New[string]()
+	for _, vol := range vmVolumeSpecsForBatch {
+		if vol.PersistentVolumeClaim == nil {
+			continue
+		}
+		key := vol.Name + ":" + vol.PersistentVolumeClaim.ClaimName
+		if existingVolVolKey.Has(key) {
+			existingVolVolKey.Delete(key)
+			continue
+		}
+		toAdd.Insert(key)
+	}
+
+	// Remaining existing batch keys are no longer referenced in the VM spec.
+	return toAdd, existingVolVolKey
 }
 
 // processBatchAttachmentAndFilterVolumeSpecs processes the batch attachment and returns the

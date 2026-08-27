@@ -18,60 +18,93 @@ import (
 	pkgconst "github.com/vmware-tanzu/vm-operator/pkg/constants"
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
 	pkgerr "github.com/vmware-tanzu/vm-operator/pkg/errors"
+	pkgutil "github.com/vmware-tanzu/vm-operator/pkg/util"
 	kubeutil "github.com/vmware-tanzu/vm-operator/pkg/util/kube"
 	vmopv1util "github.com/vmware-tanzu/vm-operator/pkg/util/vmopv1"
 )
 
 // isMigrationCandidate reports whether ctx.VM should be routed through
-// reconcileMigration this reconcile, per migration spec §4 (Trigger Model).
-// A VM is a candidate when the feature gate is on, it lacks the
+// reconcileMigration this reconcile, per migration spec §4.1 (Trigger
+// Model). A VM is a candidate when the feature gate is on, it lacks the
 // vm-owned-volumes annotation, and either the explicit trigger annotation is
-// present or it has at least one PVC-backed volume — the lazy trigger, which
-// in a level-triggered reconciler is indistinguishable from "an attach or
-// detach happened" and is safe to re-evaluate on every reconcile because
-// migration itself is idempotent (migration §17).
-func isMigrationCandidate(vm *vmopv1.VirtualMachine) bool {
+// present or a genuine attach/detach edge is pending against the VM's
+// currently-tracked volumes: a non-empty CnsNodeVMBatchAttachment add/remove
+// diff (toAdd/toRemove), or a legacy CnsNodeVmAttachment slated for
+// deletion (legacyToDelete). This is deliberately edge-triggered, not
+// level-triggered on "has a PVC-backed volume" — a stable brownfield VM
+// whose tracked volumes haven't changed produces empty diffs on every
+// reconcile and must not re-trigger migration.
+func isMigrationCandidate(
+	vm *vmopv1.VirtualMachine,
+	toAdd, toRemove sets.Set[string],
+	legacyToDelete []cnsv1alpha1.CnsNodeVmAttachment,
+) bool {
 	if vmopv1util.HasVMOwnedVolumesAnnotation(vm) {
 		return false
 	}
 	if metav1.HasAnnotation(vm.ObjectMeta, pkgconst.MigrateToVMOwnedAnnotation) {
 		return true
 	}
-	for _, vol := range vm.Spec.Volumes {
-		if vol.PersistentVolumeClaim != nil {
-			return true
-		}
-	}
-	return false
+	return toAdd.Len() > 0 || toRemove.Len() > 0 || len(legacyToDelete) > 0
 }
 
-// reconcileMigration drives a brownfield VM's already-attached disks onto
-// the CsiVolumeInfo path (migration §4, §7, §12), then flips
-// vm-owned-volumes once every disk has landed there (§4.4). It returns
-// pkgerr.RequeueError until migration completes, so the caller — ReconcileNormal
-// — never processes the triggering attach/detach as a VM-owned workflow
-// against a half-migrated VM (§4.1's ordering rule).
-func (r *Reconciler) reconcileMigration(ctx *pkgctx.VolumeContext) error {
+// reconcileMigration drives a brownfield VM's already-attached disks — both
+// BA-tracked and legacy-CnsNodeVmAttachment-tracked — onto the CsiVolumeInfo
+// path (migration §4, §7, §12), then flips vm-owned-volumes once every disk
+// has landed there (§4.4). It returns pkgerr.RequeueError until migration
+// completes, so the caller — ReconcileNormal — never processes the
+// triggering attach/detach as a VM-owned workflow against a half-migrated
+// VM (§4.1's ordering rule).
+//
+// ba, legacyAttachments, volumeSpecsForLegacy, and legacyToDelete are the
+// same read-only fetches ReconcileNormal computes for its own (non-migration)
+// batch/legacy processing, passed in rather than re-fetched here so the
+// trigger decision and the migrated-disk set are computed from one
+// consistent read (migration §4.1).
+func (r *Reconciler) reconcileMigration(
+	ctx *pkgctx.VolumeContext,
+	ba *cnsv1alpha1.CnsNodeVMBatchAttachment,
+	legacyAttachments map[string]cnsv1alpha1.CnsNodeVmAttachment,
+	volumeSpecsForLegacy []vmopv1.VirtualMachineVolume,
+	legacyToDelete []cnsv1alpha1.CnsNodeVmAttachment,
+) error {
 	vm := ctx.VM
 
-	ba, err := r.getBatchAttachmentForVM(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get CnsNodeVMBatchAttachment for migration: %w", err)
+	legacyDeleteNames := sets.New[string]()
+	for _, a := range legacyToDelete {
+		legacyDeleteNames.Insert(a.Name)
 	}
 
-	if ba == nil {
-		// No existing BA — nothing attached to migrate. The lazy trigger
-		// fired on the VM's very first PVC, so there is nothing to freeze or
-		// retire; go straight to Stage 2 so the triggering attach is
-		// processed as VM-owned Workflow A on the next reconcile.
-		ctx.Logger.Info("Migration candidate has no CnsNodeVMBatchAttachment; nothing to migrate")
+	// Only legacy-tracked disks that are still desired are migrated. One
+	// still slated for deletion is the triggering detach itself (or a
+	// stale/deprecated attachment) — it is left for the normal cleanup path
+	// once this reconcile falls through, per §4.1's ordering rule and the
+	// decision that the triggering volume is not folded into this batch.
+	var legacyToMigrate []vmopv1.VirtualMachineVolume
+	for _, vol := range volumeSpecsForLegacy {
+		attachmentName := pkgutil.CNSAttachmentNameForVolume(vm.Name, vol.Name)
+		if !legacyDeleteNames.Has(attachmentName) {
+			legacyToMigrate = append(legacyToMigrate, vol)
+		}
+	}
+
+	if ba == nil && len(legacyToMigrate) == 0 {
+		// Nothing currently tracked to migrate — the edge that made this VM
+		// a migration candidate was the triggering attach/detach itself
+		// (e.g. the VM's very first PVC, or a detach of its only tracked
+		// disk). Go straight to Stage 2 so that operation is processed as
+		// VM-owned Workflow A/B on the next reconcile.
+		ctx.Logger.Info("Migration candidate has nothing pre-existing to migrate")
 		return r.completeMigration(ctx, nil)
 	}
 
-	if ba.Annotations[pkgconst.VMOwnedMigrationAnnotation] != pkgconst.VMOwnedMigrationInProgress {
+	if ba != nil && ba.Annotations[pkgconst.VMOwnedMigrationAnnotation] != pkgconst.VMOwnedMigrationInProgress {
 		// Stage 1 — freeze (§12.1). Nothing else may proceed until this
 		// patch is confirmed observed: if a disk left BA.spec before the
-		// freeze landed, CSI would detach a live disk.
+		// freeze landed, CSI would detach a live disk. A legacy-only VM
+		// (ba == nil) needs no equivalent freeze: falling through this
+		// early-return function is itself what keeps ReconcileNormal's
+		// legacy cleanup from running concurrently with migration.
 		patch := ctrlclient.MergeFrom(ba.DeepCopy())
 		metav1.SetMetaDataAnnotation(&ba.ObjectMeta, pkgconst.VMOwnedMigrationAnnotation, pkgconst.VMOwnedMigrationInProgress)
 		if err := r.Client.Patch(ctx, ba, patch); err != nil {
@@ -82,8 +115,10 @@ func (r *Reconciler) reconcileMigration(ctx *pkgctx.VolumeContext) error {
 
 	// VKS disk-mode conversion (V12, migration §4.5) precedes the general
 	// per-disk loop below, so the loop reads the already-rewritten mode and
-	// never hands CSI a spec.vms entry the device does not yet match.
-	if kubeutil.HasCAPILabels(vm.Labels) {
+	// never hands CSI a spec.vms entry the device does not yet match. Only
+	// BA-tracked volumes are covered today; a VKS VM with legacy-tracked
+	// disks and no BA is outside this pass's scope.
+	if ba != nil && kubeutil.HasCAPILabels(vm.Labels) {
 		if err := r.convertVKSDiskModes(ctx, ba); err != nil {
 			return err
 		}
@@ -94,10 +129,85 @@ func (r *Reconciler) reconcileMigration(ctx *pkgctx.VolumeContext) error {
 		allDone  = true
 	)
 
-	for i := range ba.Spec.Volumes {
-		volSpec := ba.Spec.Volumes[i]
-		claimName := volSpec.PersistentVolumeClaim.ClaimName
-		diskMode := cnsDiskModeToCVIDiskMode(volSpec.PersistentVolumeClaim.DiskMode)
+	if ba != nil {
+		for i := range ba.Spec.Volumes {
+			volSpec := ba.Spec.Volumes[i]
+			claimName := volSpec.PersistentVolumeClaim.ClaimName
+			diskMode := cnsDiskModeToCVIDiskMode(volSpec.PersistentVolumeClaim.DiskMode)
+
+			cvi, err := vmopv1util.EnsureCVIForPVC(ctx, r.Client, vm.Namespace, claimName)
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					ctx.Logger.Info("PVC or PV not resolvable — deferring migration for this disk",
+						"pvc", claimName)
+					allDone = false
+					continue
+				}
+				return fmt.Errorf("failed to ensure CsiVolumeInfo for PVC %s during migration: %w", claimName, err)
+			}
+
+			entry := vmopv1util.VMEntry(cvi, vm.Name)
+			if entry == nil || vmopv1util.NormalizeDiskMode(entry.DiskMode) != diskMode || entry.VolumeName != volSpec.Name {
+				patch := ctrlclient.MergeFrom(cvi.DeepCopy())
+				if entry == nil {
+					cvi.Spec.VMs = append(cvi.Spec.VMs, cnsv1alpha1.VirtualMachineRef{
+						VMName:         vm.Name,
+						VMInstanceUUID: vm.Status.InstanceUUID,
+						DiskMode:       diskMode,
+						VolumeName:     volSpec.Name,
+					})
+				} else {
+					for j := range cvi.Spec.VMs {
+						if cvi.Spec.VMs[j].VMName == vm.Name {
+							cvi.Spec.VMs[j].DiskMode = diskMode
+							cvi.Spec.VMs[j].VolumeName = volSpec.Name
+						}
+					}
+				}
+				if err := r.Client.Patch(ctx, cvi, patch); err != nil {
+					return fmt.Errorf("failed to write CsiVolumeInfo spec.vms entry for PVC %s during migration: %w",
+						claimName, err)
+				}
+				ctx.Logger.Info("Wrote VM entry to CsiVolumeInfo spec.vms for migration",
+					"pvc", claimName, "cvi", cvi.Name, "diskMode", diskMode, "volumeName", volSpec.Name)
+			}
+
+			// Re-read and assert the entry landed before touching BA.spec — the
+			// entry-before-detach ordering (§4.1) that keeps CSI's PVC
+			// pvc-volume-protection finalizer handoff gapless (D5, §21.4).
+			confirmed := &cnsv1alpha1.CsiVolumeInfo{}
+			if err := r.Client.Get(ctx, ctrlclient.ObjectKey{Namespace: cvi.Namespace, Name: cvi.Name}, confirmed); err != nil {
+				return fmt.Errorf("failed to confirm CsiVolumeInfo entry for PVC %s during migration: %w", claimName, err)
+			}
+			confirmedEntry := vmopv1util.VMEntry(confirmed, vm.Name)
+			if confirmedEntry == nil {
+				return fmt.Errorf("CsiVolumeInfo entry for PVC %s did not persist during migration", claimName)
+			}
+
+			// Safe to release the disk from BA.spec now — its CVI entry exists,
+			// regardless of whether CSI has finished acting on it yet.
+			toRemove.Insert(volSpec.Name)
+
+			if vmopv1util.IsDependentMode(confirmedEntry.DiskMode) {
+				// Both clean (no annotation) and deferred (fcd-retained) count
+				// as migrated (§4.4) — VMManaged is the only gate.
+				if confirmed.Status.Ownership != cnsv1alpha1.OwnershipStateVMManaged {
+					ctx.Logger.Info("Waiting for CSI to transfer ownership during migration",
+						"pvc", claimName, "cvi", cvi.Name)
+					allDone = false
+				}
+			}
+			// Independent: entry-present is sufficient (§12.2) — already true.
+		}
+	}
+
+	// Legacy-CnsNodeVmAttachment-tracked disks migrate the same way; the
+	// mechanism-specific difference is the cleanup step below (CR deletion
+	// in place of removal from BA.spec, migration §12).
+	for i := range legacyToMigrate {
+		vol := legacyToMigrate[i]
+		claimName := vol.PersistentVolumeClaim.ClaimName
+		diskMode := vmopv1util.DiskModeForVolume(vol)
 
 		cvi, err := vmopv1util.EnsureCVIForPVC(ctx, r.Client, vm.Namespace, claimName)
 		if err != nil {
@@ -111,20 +221,20 @@ func (r *Reconciler) reconcileMigration(ctx *pkgctx.VolumeContext) error {
 		}
 
 		entry := vmopv1util.VMEntry(cvi, vm.Name)
-		if entry == nil || vmopv1util.NormalizeDiskMode(entry.DiskMode) != diskMode || entry.VolumeName != volSpec.Name {
+		if entry == nil || vmopv1util.NormalizeDiskMode(entry.DiskMode) != diskMode || entry.VolumeName != vol.Name {
 			patch := ctrlclient.MergeFrom(cvi.DeepCopy())
 			if entry == nil {
 				cvi.Spec.VMs = append(cvi.Spec.VMs, cnsv1alpha1.VirtualMachineRef{
 					VMName:         vm.Name,
 					VMInstanceUUID: vm.Status.InstanceUUID,
 					DiskMode:       diskMode,
-					VolumeName:     volSpec.Name,
+					VolumeName:     vol.Name,
 				})
 			} else {
 				for j := range cvi.Spec.VMs {
 					if cvi.Spec.VMs[j].VMName == vm.Name {
 						cvi.Spec.VMs[j].DiskMode = diskMode
-						cvi.Spec.VMs[j].VolumeName = volSpec.Name
+						cvi.Spec.VMs[j].VolumeName = vol.Name
 					}
 				}
 			}
@@ -132,13 +242,10 @@ func (r *Reconciler) reconcileMigration(ctx *pkgctx.VolumeContext) error {
 				return fmt.Errorf("failed to write CsiVolumeInfo spec.vms entry for PVC %s during migration: %w",
 					claimName, err)
 			}
-			ctx.Logger.Info("Wrote VM entry to CsiVolumeInfo spec.vms for migration",
-				"pvc", claimName, "cvi", cvi.Name, "diskMode", diskMode, "volumeName", volSpec.Name)
+			ctx.Logger.Info("Wrote VM entry to CsiVolumeInfo spec.vms for migration (legacy-tracked disk)",
+				"pvc", claimName, "cvi", cvi.Name, "diskMode", diskMode, "volumeName", vol.Name)
 		}
 
-		// Re-read and assert the entry landed before touching BA.spec — the
-		// entry-before-detach ordering (§4.1) that keeps CSI's PVC
-		// pvc-volume-protection finalizer handoff gapless (D5, §21.4).
 		confirmed := &cnsv1alpha1.CsiVolumeInfo{}
 		if err := r.Client.Get(ctx, ctrlclient.ObjectKey{Namespace: cvi.Namespace, Name: cvi.Name}, confirmed); err != nil {
 			return fmt.Errorf("failed to confirm CsiVolumeInfo entry for PVC %s during migration: %w", claimName, err)
@@ -148,23 +255,28 @@ func (r *Reconciler) reconcileMigration(ctx *pkgctx.VolumeContext) error {
 			return fmt.Errorf("CsiVolumeInfo entry for PVC %s did not persist during migration", claimName)
 		}
 
-		// Safe to release the disk from BA.spec now — its CVI entry exists,
-		// regardless of whether CSI has finished acting on it yet.
-		toRemove.Insert(volSpec.Name)
-
 		if vmopv1util.IsDependentMode(confirmedEntry.DiskMode) {
-			// Both clean (no annotation) and deferred (fcd-retained) count
-			// as migrated (§4.4) — VMManaged is the only gate.
 			if confirmed.Status.Ownership != cnsv1alpha1.OwnershipStateVMManaged {
 				ctx.Logger.Info("Waiting for CSI to transfer ownership during migration",
 					"pvc", claimName, "cvi", cvi.Name)
 				allDone = false
+				continue
 			}
 		}
-		// Independent: entry-present is sufficient (§12.2) — already true.
+
+		// Safe to delete the legacy CnsNodeVmAttachment now — its CVI entry
+		// exists and (for a dependent disk) has reached VMManaged, mirroring
+		// the BA "remove from spec" step (migration §12).
+		attachmentName := pkgutil.CNSAttachmentNameForVolume(vm.Name, vol.Name)
+		if attachment, ok := legacyAttachments[attachmentName]; ok {
+			if err := r.Client.Delete(ctx, &attachment); err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("failed to delete legacy CnsNodeVmAttachment %s after migration: %w",
+					attachment.Name, err)
+			}
+		}
 	}
 
-	if toRemove.Len() > 0 {
+	if ba != nil && toRemove.Len() > 0 {
 		patch := ctrlclient.MergeFrom(ba.DeepCopy())
 		remaining := make([]cnsv1alpha1.VolumeSpec, 0, len(ba.Spec.Volumes))
 		for _, vs := range ba.Spec.Volumes {
