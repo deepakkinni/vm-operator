@@ -50,3 +50,15 @@ type VolumeDiskPlacement struct {
 	ControllerBusNumber int32
 	UnitNumber          int32
 }
+
+// VolumeDiskModeSlot identifies one already-attached disk by its observed
+// device slot, for a batched ConvertDisksToIndependentPersistent call.
+type VolumeDiskModeSlot struct {
+	// VolumeName is vm.spec.volumes[*].name.
+	VolumeName string
+	// ControllerType, ControllerBusNumber, and UnitNumber pin the disk's
+	// current device slot, as recorded in vm.status.volumes.
+	ControllerType      vmopv1.VirtualControllerType
+	ControllerBusNumber int32
+	UnitNumber          int32
+}

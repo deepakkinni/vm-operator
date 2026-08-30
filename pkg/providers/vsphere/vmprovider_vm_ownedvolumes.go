@@ -6,11 +6,13 @@ package vsphere
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
 
 	"github.com/vmware/govmomi/object"
+	"github.com/vmware/govmomi/task"
 	"github.com/vmware/govmomi/vim25/mo"
 	vimtypes "github.com/vmware/govmomi/vim25/types"
 
@@ -110,6 +112,17 @@ func (vs *vSphereVMProvider) AttachVolumeDisks(
 	}
 
 	if _, err := resVM.Reconfigure(vmCtx, configSpec); err != nil {
+		if staleFile := staleDiskPathFault(err); staleFile != "" {
+			var staleVolumes []string
+			for _, i := range pendingIdx {
+				if disks[i].DiskPath == staleFile {
+					staleVolumes = append(staleVolumes, disks[i].VolumeName)
+				}
+			}
+			if len(staleVolumes) > 0 {
+				return nil, pkgerr.StaleDiskPathError{VolumeNames: staleVolumes, Path: staleFile, Cause: err}
+			}
+		}
 		return nil, fmt.Errorf("failed to attach %d volume disk(s) to VM %q: %w", len(deviceChanges), vm.Name, err)
 	}
 
@@ -284,6 +297,23 @@ func assertNoVMLevelCBT(configSpec *vimtypes.VirtualMachineConfigSpec) error {
 		}
 	}
 	return nil
+}
+
+// staleDiskPathFault returns the datastore path named by a ReconfigVM_Task's
+// FileNotFound fault, or "" if err is not that fault. vCenter throws this
+// when a device-add's backing file no longer exists at the given path — the
+// signal that the disk was relocated (e.g. a storage vMotion) after CSI
+// last resolved CsiVolumeInfo.spec.diskPath.
+func staleDiskPathFault(err error) string {
+	var taskErr task.Error
+	if !errors.As(err, &taskErr) {
+		return ""
+	}
+	fileNotFound, ok := taskErr.Fault().(*vimtypes.FileNotFound)
+	if !ok {
+		return ""
+	}
+	return fileNotFound.File
 }
 
 // diskModeToVim maps vmopv1.VolumeDiskMode to the vSphere API's

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -18,6 +19,7 @@ import (
 	pkgconst "github.com/vmware-tanzu/vm-operator/pkg/constants"
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
 	pkgerr "github.com/vmware-tanzu/vm-operator/pkg/errors"
+	"github.com/vmware-tanzu/vm-operator/pkg/providers"
 	pkgutil "github.com/vmware-tanzu/vm-operator/pkg/util"
 	kubeutil "github.com/vmware-tanzu/vm-operator/pkg/util/kube"
 	vmopv1util "github.com/vmware-tanzu/vm-operator/pkg/util/vmopv1"
@@ -88,6 +90,18 @@ func (r *Reconciler) reconcileMigration(
 		}
 	}
 
+	// VKS disk-mode conversion (V12, migration §4.5) runs off vm.status.volumes
+	// — mechanism-agnostic, so it covers a disk regardless of whether it is
+	// BA-tracked, legacy-CnsNodeVmAttachment-tracked, or already attached by
+	// some other means — before the ba==nil short-circuit below, so a
+	// not-yet-migrated VKS VM's already-attached disks are still evaluated
+	// even when this reconcile has nothing BA/legacy-tracked left to migrate.
+	if kubeutil.HasCAPILabels(vm.Labels) {
+		if err := r.convertVKSDiskModes(ctx, vm); err != nil {
+			return err
+		}
+	}
+
 	if ba == nil && len(legacyToMigrate) == 0 {
 		// Nothing currently tracked to migrate — the edge that made this VM
 		// a migration candidate was the triggering attach/detach itself
@@ -113,17 +127,6 @@ func (r *Reconciler) reconcileMigration(
 		ctx.Logger.Info("Froze CnsNodeVMBatchAttachment for migration", "batchAttachment", ba.Name)
 	}
 
-	// VKS disk-mode conversion (V12, migration §4.5) precedes the general
-	// per-disk loop below, so the loop reads the already-rewritten mode and
-	// never hands CSI a spec.vms entry the device does not yet match. Only
-	// BA-tracked volumes are covered today; a VKS VM with legacy-tracked
-	// disks and no BA is outside this pass's scope.
-	if ba != nil && kubeutil.HasCAPILabels(vm.Labels) {
-		if err := r.convertVKSDiskModes(ctx, ba); err != nil {
-			return err
-		}
-	}
-
 	var (
 		toRemove = sets.New[string]()
 		allDone  = true
@@ -134,6 +137,14 @@ func (r *Reconciler) reconcileMigration(
 			volSpec := ba.Spec.Volumes[i]
 			claimName := volSpec.PersistentVolumeClaim.ClaimName
 			diskMode := cnsDiskModeToCVIDiskMode(volSpec.PersistentVolumeClaim.DiskMode)
+			if specVol := findVolumeSpecByName(vm, volSpec.Name); specVol != nil {
+				// The BA's own DiskMode may be stale relative to a VKS
+				// conversion this reconcile just durably patched onto
+				// vm.spec.volumes (convertVKSDiskModes, above) — vm.spec is
+				// the authoritative source once it has an entry for this
+				// volume.
+				diskMode = vmopv1util.DiskModeForVolume(*specVol)
+			}
 
 			cvi, err := vmopv1util.EnsureCVIForPVC(ctx, r.Client, vm.Namespace, claimName)
 			if err != nil {
@@ -206,6 +217,12 @@ func (r *Reconciler) reconcileMigration(
 	// in place of removal from BA.spec, migration §12).
 	for i := range legacyToMigrate {
 		vol := legacyToMigrate[i]
+		if live := findVolumeSpecByName(vm, vol.Name); live != nil {
+			// legacyToMigrate is a snapshot taken before convertVKSDiskModes
+			// ran; re-read the current spec value so a VKS conversion above
+			// is reflected in the CVI entry this loop writes.
+			vol = *live
+		}
 		claimName := vol.PersistentVolumeClaim.ClaimName
 		diskMode := vmopv1util.DiskModeForVolume(vol)
 
@@ -337,24 +354,77 @@ func (r *Reconciler) completeMigration(ctx *pkgctx.VolumeContext, ba *cnsv1alpha
 	return nil
 }
 
-// convertVKSDiskModes implements migration §4.5 for a VKS node VM: every
-// non-boot PVC disk on the BA — which, by construction, is every disk on the
-// BA, since a boot disk has no PVC and is never tracked there — is converted
-// from dependent-persistent to independent-persistent before the shared
-// per-disk migration loop hands it to the CVI. Mutates ba.Spec.Volumes'
-// in-memory DiskMode so the caller's loop sees the new mode without a
-// re-fetch.
-func (r *Reconciler) convertVKSDiskModes(ctx *pkgctx.VolumeContext, ba *cnsv1alpha1.CnsNodeVMBatchAttachment) error {
-	vm := ctx.VM
+// vksDiskModeCandidate is one attached, non-machine-owned PVC disk on a VKS
+// node VM that still needs converting to independent-persistent.
+type vksDiskModeCandidate struct {
+	volumeName          string
+	controllerType      vmopv1.VirtualControllerType
+	controllerBusNumber int32
+	unitNumber          int32
+}
 
-	needsConversion := false
-	for _, vs := range ba.Spec.Volumes {
-		if vs.PersistentVolumeClaim.DiskMode != cnsv1alpha1.IndependentPersistent {
-			needsConversion = true
-			break
+// convertVKSDiskModes implements migration §4.5 for a VKS node VM: every
+// currently-attached PVC disk that is NOT the node VM's own machine-lifecycle
+// disk (i.e. its PVC's ownerReferences do not identify a VirtualMachine or
+// VSphereMachine) — a Kubernetes workload volume CSI attached to the node
+// from inside the guest cluster — is converted from dependent-persistent to
+// independent-persistent in a single ReconfigVM_Task. Driven off
+// vm.status.volumes so it covers a disk regardless of whether it is tracked
+// via a CnsNodeVMBatchAttachment, a legacy CnsNodeVmAttachment, or already a
+// CsiVolumeInfo. The vm.spec.volumes patch below is the only durable record
+// of the conversion; the caller's subsequent per-disk migration loop must
+// re-read disk mode from vm.spec.volumes rather than trust a BA/legacy
+// snapshot taken before this function ran.
+func (r *Reconciler) convertVKSDiskModes(ctx *pkgctx.VolumeContext, vm *vmopv1.VirtualMachine) error {
+	var candidates []vksDiskModeCandidate
+
+	for i := range vm.Status.Volumes {
+		vs := &vm.Status.Volumes[i]
+		if vs.Type != vmopv1.VolumeTypeManaged {
+			continue
 		}
+		if vs.DiskMode == vmopv1.VolumeDiskModeIndependentPersistent {
+			continue
+		}
+
+		specVol := findVolumeSpecByName(vm, vs.Name)
+		if specVol == nil || specVol.PersistentVolumeClaim == nil {
+			// No PVC to classify (volume removed concurrently, or not
+			// PVC-backed) — nothing to convert.
+			continue
+		}
+
+		pvc := &corev1.PersistentVolumeClaim{}
+		if err := r.Client.Get(ctx,
+			ctrlclient.ObjectKey{Namespace: vm.Namespace, Name: specVol.PersistentVolumeClaim.ClaimName},
+			pvc); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return fmt.Errorf("failed to get PVC %s to classify machine-ownership during VKS conversion: %w",
+				specVol.PersistentVolumeClaim.ClaimName, err)
+		}
+		if vmopv1util.IsMachineOwnedPVC(pvc) {
+			// The node VM's own disk — leave dependent.
+			continue
+		}
+
+		if vs.ControllerBusNumber == nil || vs.UnitNumber == nil {
+			return pkgerr.RequeueError{
+				After: 5 * time.Second,
+				Message: fmt.Sprintf(
+					"waiting for device slot for volume %s before VKS disk-mode conversion", vs.Name),
+			}
+		}
+		candidates = append(candidates, vksDiskModeCandidate{
+			volumeName:          vs.Name,
+			controllerType:      vs.ControllerType,
+			controllerBusNumber: *vs.ControllerBusNumber,
+			unitNumber:          *vs.UnitNumber,
+		})
 	}
-	if !needsConversion {
+
+	if len(candidates) == 0 {
 		return nil
 	}
 
@@ -377,45 +447,41 @@ func (r *Reconciler) convertVKSDiskModes(ctx *pkgctx.VolumeContext, ba *cnsv1alp
 		}
 	}
 
-	for i := range ba.Spec.Volumes {
-		vs := &ba.Spec.Volumes[i]
-		if vs.PersistentVolumeClaim.DiskMode == cnsv1alpha1.IndependentPersistent {
-			continue
-		}
-
-		if specVol := findVolumeSpecByName(vm, vs.Name); specVol != nil &&
-			specVol.DiskMode != vmopv1.VolumeDiskModeIndependentPersistent {
-			// Deliberate, spec-mandated controller write to spec.volumes
-			// (migration §4.5) — the same kind of exception to the
-			// controllers-don't-write-spec rule that restoreVMSpecFromSnapshot
-			// takes for reverts. Nothing else writes diskMode on a node VM.
-			vmPatch := ctrlclient.MergeFrom(vm.DeepCopy())
-			for j := range vm.Spec.Volumes {
-				if vm.Spec.Volumes[j].Name == vs.Name {
-					vm.Spec.Volumes[j].DiskMode = vmopv1.VolumeDiskModeIndependentPersistent
-				}
-			}
-			if err := r.Client.Patch(ctx, vm, vmPatch); err != nil {
-				return fmt.Errorf("failed to rewrite disk mode for volume %s during VKS migration: %w", vs.Name, err)
+	// One patch covering every candidate's spec.diskMode — a deliberate,
+	// spec-mandated controller write (migration §4.5), the same kind of
+	// exception to the controllers-don't-write-spec rule that
+	// restoreVMSpecFromSnapshot takes for reverts.
+	vmPatch := ctrlclient.MergeFrom(vm.DeepCopy())
+	for _, c := range candidates {
+		for j := range vm.Spec.Volumes {
+			if vm.Spec.Volumes[j].Name == c.volumeName {
+				vm.Spec.Volumes[j].DiskMode = vmopv1.VolumeDiskModeIndependentPersistent
 			}
 		}
+	}
+	if err := r.Client.Patch(ctx, vm, vmPatch); err != nil {
+		return fmt.Errorf("failed to rewrite disk mode for %d volume(s) during VKS migration: %w",
+			len(candidates), err)
+	}
 
-		statusVol := findVolumeStatusByName(vm, vs.Name)
-		if statusVol == nil || statusVol.ControllerBusNumber == nil || statusVol.UnitNumber == nil {
-			return pkgerr.RequeueError{
-				After: 5 * time.Second,
-				Message: fmt.Sprintf(
-					"waiting for device slot for volume %s before VKS disk-mode conversion", vs.Name),
-			}
+	slots := make([]providers.VolumeDiskModeSlot, 0, len(candidates))
+	for _, c := range candidates {
+		slots = append(slots, providers.VolumeDiskModeSlot{
+			VolumeName:          c.volumeName,
+			ControllerType:      c.controllerType,
+			ControllerBusNumber: c.controllerBusNumber,
+			UnitNumber:          c.unitNumber,
+		})
+	}
+	if err := r.VMProvider.ConvertDisksToIndependentPersistent(ctx, vm, slots); err != nil {
+		return fmt.Errorf("failed to reconfigure %d volume(s) to independent-persistent: %w", len(candidates), err)
+	}
+
+	for _, c := range candidates {
+		if statusVol := findVolumeStatusByName(vm, c.volumeName); statusVol != nil {
+			statusVol.DiskMode = vmopv1.VolumeDiskModeIndependentPersistent
 		}
-
-		if err := r.VMProvider.ConvertDiskToIndependentPersistent(
-			ctx, vm, statusVol.ControllerType, *statusVol.ControllerBusNumber, *statusVol.UnitNumber); err != nil {
-			return fmt.Errorf("failed to reconfigure volume %s to independent-persistent: %w", vs.Name, err)
-		}
-		ctx.Logger.Info("Converted VKS disk to independent-persistent", "volume", vs.Name)
-
-		vs.PersistentVolumeClaim.DiskMode = cnsv1alpha1.IndependentPersistent
+		ctx.Logger.Info("Converted VKS workload disk to independent-persistent", "volume", c.volumeName)
 	}
 
 	return nil

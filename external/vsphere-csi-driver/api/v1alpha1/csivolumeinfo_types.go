@@ -33,6 +33,21 @@ const (
 	// a volume must be enforced by consulting this annotation rather than by
 	// relying on CNS to return NotFound.
 	FcdRetainedAnnotation = "csi.vsphere.vmware.com/fcd-retained"
+
+	// DiskPathRefreshRequestedAnnotation is set by vm-operator on a CVI
+	// whose spec.diskPath it consumed in a ReconfigVM_Task that failed with
+	// a FileNotFound fault against that exact path — the disk was
+	// relocated (e.g. a storage vMotion) after CSI last resolved diskPath.
+	// vm-operator never clears spec.diskPath itself to signal this: for a
+	// dependent (VMManaged) volume, diskPath being non-empty is a durable
+	// invariant vm-operator's own attach path also relies on, so clearing
+	// it would trip that check. This annotation is the signal instead; CSI's
+	// csivolumeinfo controller re-resolves the live path and replaces the
+	// value directly — never observably empty in between — then clears
+	// this annotation. vm-operator waits for the annotation to be gone
+	// (and observedGeneration to have advanced past the refresh) before
+	// retrying the attach with the new value.
+	DiskPathRefreshRequestedAnnotation = "csi.vsphere.vmware.com/diskpath-refresh-requested"
 )
 
 // OwnershipState is the current ownership of the volume.

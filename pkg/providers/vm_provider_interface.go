@@ -158,10 +158,12 @@ type VirtualMachineProviderInterface interface {
 	// snapshot is present.
 	HasAnySnapshot(ctx context.Context, vm *vmopv1.VirtualMachine) (bool, error)
 
-	// ConvertDiskToIndependentPersistent reconfigures the virtual disk at the
-	// given controller slot to VirtualDiskMode independent_persistent. This
+	// ConvertDisksToIndependentPersistent reconfigures every given disk, in a
+	// single ReconfigVM_Task, to VirtualDiskMode independent_persistent. Each
 	// edits an existing device in place — no add, no vDiskId, no CBT
 	// directive (migration §4.5) — and must never be combined with a
-	// VM-level changeTrackingEnabled change (attach/detach §5.6).
-	ConvertDiskToIndependentPersistent(ctx context.Context, vm *vmopv1.VirtualMachine, controllerType vmopv1.VirtualControllerType, controllerBusNumber, unitNumber int32) error
+	// VM-level changeTrackingEnabled change (attach/detach §5.6). A disk
+	// already in independent_persistent mode is omitted from the request,
+	// so a partially applied batch converges on retry.
+	ConvertDisksToIndependentPersistent(ctx context.Context, vm *vmopv1.VirtualMachine, slots []VolumeDiskModeSlot) error
 }

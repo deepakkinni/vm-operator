@@ -5,9 +5,12 @@
 package vsphere
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/vmware/govmomi/object"
+	"github.com/vmware/govmomi/task"
 	vimtypes "github.com/vmware/govmomi/vim25/types"
 
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
@@ -277,6 +280,41 @@ func TestAssertNoVMLevelCBT(t *testing.T) {
 			if err == nil {
 				t.Errorf("ChangeTrackingEnabled=%v: expected an error, got none", v)
 			}
+		}
+	})
+}
+
+func TestStaleDiskPathFault(t *testing.T) {
+	taskErrWithFault := func(fault vimtypes.BaseMethodFault) error {
+		return task.Error{LocalizedMethodFault: &vimtypes.LocalizedMethodFault{Fault: fault}}
+	}
+
+	t.Run("FileNotFound fault returns the offending file", func(t *testing.T) {
+		err := fmt.Errorf("reconfigure VM task failed: %w",
+			taskErrWithFault(&vimtypes.FileNotFound{FileFault: vimtypes.FileFault{File: "[ds1] fcd/gone.vmdk"}}))
+
+		got := staleDiskPathFault(err)
+		if got != "[ds1] fcd/gone.vmdk" {
+			t.Errorf("staleDiskPathFault() = %q, want %q", got, "[ds1] fcd/gone.vmdk")
+		}
+	})
+
+	t.Run("a different fault type returns empty", func(t *testing.T) {
+		err := taskErrWithFault(&vimtypes.InvalidDeviceSpec{DeviceIndex: 0})
+		if got := staleDiskPathFault(err); got != "" {
+			t.Errorf("staleDiskPathFault() = %q, want empty for a non-FileNotFound fault", got)
+		}
+	})
+
+	t.Run("a plain error (not a task.Error) returns empty", func(t *testing.T) {
+		if got := staleDiskPathFault(errors.New("boom")); got != "" {
+			t.Errorf("staleDiskPathFault() = %q, want empty for a non-task error", got)
+		}
+	})
+
+	t.Run("nil error returns empty", func(t *testing.T) {
+		if got := staleDiskPathFault(nil); got != "" {
+			t.Errorf("staleDiskPathFault() = %q, want empty for a nil error", got)
 		}
 	})
 }

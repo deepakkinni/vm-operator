@@ -207,6 +207,42 @@ var _ = DescribeTable("DiskModeForVolume / IsDependentMode",
 	),
 )
 
+var _ = DescribeTable("IsMachineOwnedPVC",
+	func(owners []metav1.OwnerReference, expected bool) {
+		pvc := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            "my-pvc",
+				Namespace:       "test-ns",
+				OwnerReferences: owners,
+			},
+		}
+		Ω(vmopv1util.IsMachineOwnedPVC(pvc)).Should(Equal(expected))
+	},
+	Entry("returns false when there are no owner references",
+		nil,
+		false,
+	),
+	Entry("returns true when owned by a VirtualMachine",
+		[]metav1.OwnerReference{{Kind: "VirtualMachine", Name: "my-vm"}},
+		true,
+	),
+	Entry("returns true when owned by a VSphereMachine",
+		[]metav1.OwnerReference{{Kind: "VSphereMachine", Name: "my-machine"}},
+		true,
+	),
+	Entry("returns false when owned by an unrelated kind",
+		[]metav1.OwnerReference{{Kind: "Deployment", Name: "my-deployment"}},
+		false,
+	),
+	Entry("returns true when one of multiple owners matches",
+		[]metav1.OwnerReference{
+			{Kind: "Deployment", Name: "my-deployment"},
+			{Kind: "VirtualMachine", Name: "my-vm"},
+		},
+		true,
+	),
+)
+
 var _ = Describe("GetCVIForPVC", func() {
 	const (
 		ns       = "test-ns"

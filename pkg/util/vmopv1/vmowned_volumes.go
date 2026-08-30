@@ -311,6 +311,34 @@ func IsLinkedClonePVC(pvc *corev1.PersistentVolumeClaim) bool {
 	return pvc.Annotations[pkgconst.PVCFastProvisioningAnnotation] == "true"
 }
 
+// machineOwnedPVCKinds are the ownerReference kinds that identify a PVC as a
+// VKS node VM's own machine-lifecycle disk, as opposed to a Kubernetes
+// workload volume CSI attached to the node from inside the guest cluster.
+// Matched on Kind only: a VSphereMachine's exact apiVersion/group is not
+// pinned here.
+var machineOwnedPVCKinds = map[string]struct{}{
+	"VirtualMachine": {}, // vmoperator.vmware.com/v1alpha6
+	"VSphereMachine": {}, // vmware.infrastructure.cluster.x-k8s.io/v1beta2
+}
+
+// IsMachineOwnedPVC reports whether the PVC's ownerReferences identify it as
+// a VKS node VM's own machine-lifecycle disk (owned by a VirtualMachine or
+// VSphereMachine), as opposed to a Kubernetes workload volume attached to
+// the node from inside the guest cluster. A PVC with no owner references, or
+// owners of any other kind, is not machine-owned: on a VKS node VM this is
+// the signal that the volume must be forced to
+// VolumeDiskModeIndependentPersistent, so a workload PVC's lifecycle can
+// never be entangled with the node VM's own disk-unregister/ownership
+// semantics.
+func IsMachineOwnedPVC(pvc *corev1.PersistentVolumeClaim) bool {
+	for _, ref := range pvc.OwnerReferences {
+		if _, ok := machineOwnedPVCKinds[ref.Kind]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 // IsGreenSignal reports whether the CsiVolumeInfo status has the green signal
 // that permits vm-operator to add the disk to the VM.
 // Green signal = status.ownership==VMManaged && status.phase==Succeeded

@@ -729,6 +729,102 @@ var _ = Describe(
 							Expect(vm.Status.Volumes[0].Attached).To(BeTrue(),
 								"Attached must be true after attach so reconcileVolumes does not block power-on")
 						})
+
+						It("requests a diskPath refresh and requeues, instead of failing hard, when the "+
+							"reconfigure fails with a stale disk path", func() {
+							ctx.VMProvider.(*providerfake.VMProvider).AttachVolumeDisksFn = func(
+								_ context.Context, _ *vmopv1.VirtualMachine, disks []providers.VolumeDiskAddSpec,
+							) ([]providers.VolumeDiskPlacement, error) {
+								return nil, pkgerr.StaleDiskPathError{
+									VolumeNames: []string{"vol-persistent"},
+									Path:        disks[0].DiskPath,
+									Cause:       errors.New("file not found"),
+								}
+							}
+
+							err := reconciler.ReconcileNormal(volCtx)
+							var requeue pkgerr.RequeueError
+							Expect(errors.As(err, &requeue)).To(BeTrue(),
+								"a stale disk path must requeue, not fail hard, got: %v", err)
+							Expect(vm.Status.Volumes).To(BeEmpty(), "no status entry until the attach actually succeeds")
+
+							cvi := &cnsv1alpha1.CsiVolumeInfo{}
+							Expect(ctx.Client.Get(ctx, client.ObjectKey{
+								Name:      vmopv1util.CVINameForVolumeID(volID),
+								Namespace: cnsv1alpha1.CVINamespace,
+							}, cvi)).To(Succeed())
+							_, requested := cvi.Annotations[cnsv1alpha1.DiskPathRefreshRequestedAnnotation]
+							Expect(requested).To(BeTrue(),
+								"the CVI must carry the refresh-requested annotation after a stale-path failure")
+						})
+
+						When("the CVI already carries the diskpath-refresh-requested annotation", func() {
+							JustBeforeEach(func() {
+								cvi := &cnsv1alpha1.CsiVolumeInfo{}
+								Expect(ctx.Client.Get(ctx, client.ObjectKey{
+									Name:      vmopv1util.CVINameForVolumeID(volID),
+									Namespace: cnsv1alpha1.CVINamespace,
+								}, cvi)).To(Succeed())
+								patch := client.MergeFrom(cvi.DeepCopy())
+								metav1.SetMetaDataAnnotation(&cvi.ObjectMeta,
+									cnsv1alpha1.DiskPathRefreshRequestedAnnotation, "true")
+								Expect(ctx.Client.Patch(ctx, cvi, patch)).To(Succeed())
+							})
+
+							It("waits rather than attaching with the still-unrefreshed diskPath", func() {
+								attachCalled := false
+								ctx.VMProvider.(*providerfake.VMProvider).AttachVolumeDisksFn = func(
+									_ context.Context, _ *vmopv1.VirtualMachine, _ []providers.VolumeDiskAddSpec,
+								) ([]providers.VolumeDiskPlacement, error) {
+									attachCalled = true
+									return nil, nil
+								}
+
+								err := reconciler.ReconcileNormal(volCtx)
+								Expect(pkgerr.IsRequeueError(err)).To(BeTrue())
+								Expect(attachCalled).To(BeFalse(),
+									"must not attempt attach while a refresh is still pending")
+								Expect(vm.Status.Volumes).To(BeEmpty())
+							})
+						})
+					})
+
+					When("VM has an independent-persistent volume with its CVI entry present but never green-signalled", func() {
+						BeforeEach(func() {
+							pvc, pv, cvi := buildPVCWithCVI(pvcName, pvName, volID)
+							// Independent volumes are never ownership-transferred:
+							// CSI stays CSIManaged forever and only publishes
+							// diskPath. Pre-set the VM entry so the reconciler
+							// skips the patch step and proceeds to the readiness
+							// check on this never-VMManaged CVI.
+							cvi.Spec.VMs = []cnsv1alpha1.VirtualMachineRef{
+								{VMName: vmName, VolumeName: "vol-independent", DiskMode: cnsv1alpha1.CVIDiskModeIndependentPersistent},
+							}
+							cvi.Status.Ownership = cnsv1alpha1.OwnershipStateCSIManaged
+							initObjects = append(initObjects, pvc, pv, cvi)
+
+							vm.Spec.Volumes = []vmopv1.VirtualMachineVolume{
+								{
+									Name:     "vol-independent",
+									DiskMode: vmopv1.VolumeDiskModeIndependentPersistent,
+									VirtualMachineVolumeSource: vmopv1.VirtualMachineVolumeSource{
+										PersistentVolumeClaim: &vmopv1.PersistentVolumeClaimVolumeSource{
+											PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+												ClaimName: pvcName,
+											},
+										},
+									},
+								},
+							}
+						})
+
+						It("attaches the disk without waiting for a green signal that will never come", func() {
+							err := reconciler.ReconcileNormal(volCtx)
+							Expect(err).ToNot(HaveOccurred())
+							Expect(vm.Status.Volumes).To(HaveLen(1))
+							Expect(vm.Status.Volumes[0].Name).To(Equal("vol-independent"))
+							Expect(vm.Status.Volumes[0].Attached).To(BeTrue())
+						})
 					})
 
 					When("VM has an fcd-retained dependent-persistent volume, green and ready", func() {

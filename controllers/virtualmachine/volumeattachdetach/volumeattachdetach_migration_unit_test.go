@@ -24,6 +24,7 @@ import (
 	"github.com/vmware-tanzu/vm-operator/pkg/constants/testlabels"
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
 	pkgerr "github.com/vmware-tanzu/vm-operator/pkg/errors"
+	"github.com/vmware-tanzu/vm-operator/pkg/providers"
 	providerfake "github.com/vmware-tanzu/vm-operator/pkg/providers/fake"
 	pkgutil "github.com/vmware-tanzu/vm-operator/pkg/util"
 	"github.com/vmware-tanzu/vm-operator/pkg/util/ptr"
@@ -395,26 +396,23 @@ var _ = Describe(
 			})
 
 			It("converts the disk to independent-persistent before re-homing it", func() {
-				var convertedCtrlType vmopv1.VirtualControllerType
-				var convertedBus, convertedUnit int32
-				ctx.VMProvider.(*providerfake.VMProvider).ConvertDiskToIndependentPersistentFn = func(
+				var convertedSlots []providers.VolumeDiskModeSlot
+				ctx.VMProvider.(*providerfake.VMProvider).ConvertDisksToIndependentPersistentFn = func(
 					_ context.Context,
 					_ *vmopv1.VirtualMachine,
-					controllerType vmopv1.VirtualControllerType,
-					controllerBusNumber, unitNumber int32) error {
+					slots []providers.VolumeDiskModeSlot) error {
 
-					convertedCtrlType = controllerType
-					convertedBus = controllerBusNumber
-					convertedUnit = unitNumber
+					convertedSlots = slots
 					return nil
 				}
 
 				err := reconciler.ReconcileNormal(volCtx)
 				Expect(err).ToNot(HaveOccurred())
 
-				Expect(convertedCtrlType).To(Equal(vmopv1.VirtualControllerTypeSCSI))
-				Expect(convertedBus).To(Equal(int32(0)))
-				Expect(convertedUnit).To(Equal(int32(1)))
+				Expect(convertedSlots).To(HaveLen(1))
+				Expect(convertedSlots[0].ControllerType).To(Equal(vmopv1.VirtualControllerTypeSCSI))
+				Expect(convertedSlots[0].ControllerBusNumber).To(Equal(int32(0)))
+				Expect(convertedSlots[0].UnitNumber).To(Equal(int32(1)))
 
 				Expect(vm.Spec.Volumes[0].DiskMode).To(Equal(vmopv1.VolumeDiskModeIndependentPersistent))
 

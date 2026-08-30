@@ -11,6 +11,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
@@ -20,6 +21,7 @@ import (
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
 	pkgerr "github.com/vmware-tanzu/vm-operator/pkg/errors"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers"
+	kubeutil "github.com/vmware-tanzu/vm-operator/pkg/util/kube"
 	vmopv1util "github.com/vmware-tanzu/vm-operator/pkg/util/vmopv1"
 	"github.com/vmware-tanzu/vm-operator/pkg/volumes/owned"
 )
@@ -89,11 +91,12 @@ type readyDependentDisk struct {
 // §7.3 note); a single RequeueError is returned at the end if any volume is
 // still pending.
 //
-// Independent-mode device attach (backing resolution, vDiskId, per-disk CBT)
-// is not yet implemented — it depends on a CNS/vslm client this codebase does
-// not have. The entry is written to the CVI; the device add itself requeues
-// indefinitely until that dependency lands (see V3/V4 in the implementation
-// plan).
+// On a VKS node VM, a volume whose PVC is not owned by the node's own
+// VirtualMachine or VSphereMachine is a Kubernetes workload volume attached
+// from inside the guest cluster; its spec.diskMode is forced to
+// independent-persistent before its CsiVolumeInfo entry is written, so its
+// lifecycle is never entangled with the node VM's own disk-unregister/
+// ownership semantics.
 func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error {
 
 	vm := ctx.VM
@@ -108,6 +111,7 @@ func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error
 
 	needRequeue := false
 	ready := make([]readyDependentDisk, 0, len(vm.Spec.Volumes))
+	isVKS := kubeutil.HasCAPILabels(vm.Labels)
 
 	for _, plan := range owned.ClassifyVolumes(vm) {
 		// Already attached — nothing to do.
@@ -116,6 +120,33 @@ func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error
 		}
 
 		claimName := plan.ClaimName
+
+		// On a VKS node VM, a PVC not owned by the node's own VirtualMachine
+		// or VSphereMachine is a Kubernetes workload volume CSI attached
+		// from inside the guest cluster — its lifecycle must never be
+		// entangled with the node VM's own disk-unregister/ownership
+		// semantics, so it is forced to independent-persistent before its
+		// CsiVolumeInfo entry is written.
+		var pvc *corev1.PersistentVolumeClaim
+		if isVKS {
+			pvc = &corev1.PersistentVolumeClaim{}
+			if err := r.Client.Get(ctx, ctrlclient.ObjectKey{Namespace: vm.Namespace, Name: claimName}, pvc); err != nil {
+				if apierrors.IsNotFound(err) {
+					ctx.Logger.Info("PVC not resolvable — skipping vm-owned volumes path for now",
+						"pvc", claimName)
+					continue
+				}
+				return fmt.Errorf("failed to get PVC %s to classify machine-ownership: %w", claimName, err)
+			}
+			if !vmopv1util.IsMachineOwnedPVC(pvc) && plan.RawDiskMode != vmopv1.VolumeDiskModeIndependentPersistent {
+				if err := r.forceIndependentPersistentDiskMode(ctx, vm, plan.VolumeName); err != nil {
+					return err
+				}
+				plan.RawDiskMode = vmopv1.VolumeDiskModeIndependentPersistent
+				plan.DiskMode = cnsv1alpha1.CVIDiskModeIndependentPersistent
+				plan.Dependent = false
+			}
+		}
 
 		// Writing this entry is the only PVC-usage bookkeeping vm-operator
 		// does here. The `cns.vmware.com/usedby-vm-<uuid>` label on the PVC
@@ -173,24 +204,36 @@ func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error
 			continue
 		}
 
-		if !plan.Dependent {
-			// Independent-mode readiness and device attach land in a later
-			// change — see the function doc comment. The entry is on the
-			// CVI; the device add itself is not yet implemented. Whichever
-			// change adds it must write vm.status.volumes directly with
-			// Type: Managed, the same as attachReadyDisks does below — an
-			// independent disk is still an FCD (di.FCD is true), and
-			// updateVolumeStatus's generic scan never creates a fresh status
-			// entry for an FCD it doesn't already know about (attach/detach
-			// V10 item 1), so nothing else will do it.
-			ctx.Logger.Info("Independent-mode VM-owned volume entry present; device attach pending",
+		// A previously-requested diskPath refresh (see requestDiskPathRefresh)
+		// is still in flight: CSI clears this annotation only after it has
+		// already replaced spec.diskPath with the freshly-resolved value, so
+		// its presence means the field on this read cannot be trusted yet —
+		// for either disk mode. Wait rather than retry with what is likely
+		// still the same stale value that caused the refresh request.
+		if _, refreshPending := cvi.Annotations[cnsv1alpha1.DiskPathRefreshRequestedAnnotation]; refreshPending {
+			ctx.Logger.Info("Waiting for CSI to refresh a stale diskPath",
 				"pvc", claimName, "cvi", cvi.Name)
 			needRequeue = true
 			continue
 		}
 
-		if !vmopv1util.IsGreenSignal(cvi) {
-			ctx.Logger.Info("Waiting for CSI to unregister volume (green signal not yet present)",
+		// Two readiness classes (attach/detach §7.3 A.4/A.5): a dependent
+		// disk requires CSI's ownership-transfer handshake to finish — the
+		// green signal — before its FCD is vm-operator's to attach. An
+		// independent disk is never transferred: CSI stays CSIManaged and
+		// only needs to publish spec.diskPath, so it is ready as soon as
+		// that is present. Waiting on IsGreenSignal (Ownership==VMManaged)
+		// for an independent disk would wait forever, since CSI never
+		// flips ownership for one.
+		if plan.Dependent {
+			if !vmopv1util.IsGreenSignal(cvi) {
+				ctx.Logger.Info("Waiting for CSI to unregister volume (green signal not yet present)",
+					"pvc", claimName, "cvi", cvi.Name)
+				needRequeue = true
+				continue
+			}
+		} else if cvi.Spec.DiskPath == "" {
+			ctx.Logger.Info("Waiting for CSI to provision diskPath for independent volume",
 				"pvc", claimName, "cvi", cvi.Name)
 			needRequeue = true
 			continue
@@ -198,7 +241,7 @@ func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error
 
 		diskPath := cvi.Spec.DiskPath
 		if diskPath == "" {
-			return fmt.Errorf("CsiVolumeInfo %s has empty diskPath after green signal", cvi.Name)
+			return fmt.Errorf("CsiVolumeInfo %s has empty diskPath after readiness check", cvi.Name)
 		}
 
 		rd := readyDependentDisk{
@@ -219,9 +262,11 @@ func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error
 			// reserves that directive for independent disks, and the
 			// platform's default already produces the correct row for a
 			// dependent fcd-retained disk.
-			pvc := &corev1.PersistentVolumeClaim{}
-			if err := r.Client.Get(ctx, ctrlclient.ObjectKey{Namespace: vm.Namespace, Name: claimName}, pvc); err != nil {
-				return fmt.Errorf("failed to get PVC %s to check linked-clone annotation: %w", claimName, err)
+			if pvc == nil {
+				pvc = &corev1.PersistentVolumeClaim{}
+				if err := r.Client.Get(ctx, ctrlclient.ObjectKey{Namespace: vm.Namespace, Name: claimName}, pvc); err != nil {
+					return fmt.Errorf("failed to get PVC %s to check linked-clone annotation: %w", claimName, err)
+				}
 			}
 			if vmopv1util.IsLinkedClonePVC(pvc) {
 				rd.fcdID = cvi.Spec.VolumeID
@@ -272,6 +317,28 @@ func (r *Reconciler) attachReadyDisks(
 
 	placements, err := r.VMProvider.AttachVolumeDisks(ctx, vm, disks)
 	if err != nil {
+		if stale, ok := pkgerr.AsStaleDiskPathError(err); ok {
+			// The disk was relocated (e.g. storage vMotion) after CSI last
+			// resolved its CsiVolumeInfo.spec.diskPath. Request a refresh
+			// per affected volume rather than surfacing a hard failure —
+			// this is expected-if-rare, not a bug, and CSI's
+			// csivolumeinfo controller knows how to re-resolve it for
+			// either disk mode (see the annotation's doc comment).
+			for _, volumeName := range stale.VolumeNames {
+				rd, ok := readyDiskByVolumeName(ready, volumeName)
+				if !ok {
+					continue
+				}
+				if reqErr := r.requestDiskPathRefresh(ctx, vm, rd.plan.ClaimName); reqErr != nil {
+					return fmt.Errorf("failed to request diskPath refresh for volume %q: %w", volumeName, reqErr)
+				}
+			}
+			return pkgerr.RequeueError{
+				After: 5 * time.Second,
+				Message: fmt.Sprintf(
+					"stale diskPath %q for %d volume(s); requested a CSI refresh", stale.Path, len(stale.VolumeNames)),
+			}
+		}
 		// Surface the failure against every disk in the batch, naming none
 		// as the culprit — vCenter rejects the whole ReconfigVM_Task for a
 		// malformed spec on any one disk, so triage must start from the
@@ -310,12 +377,80 @@ func (r *Reconciler) attachReadyDisks(
 			Type:                vmopv1.VolumeTypeManaged,
 			DiskUUID:            diskUUID,
 			Attached:            true,
+			DiskMode:            rd.plan.RawDiskMode,
 			ControllerType:      p.ControllerType,
 			ControllerBusNumber: &p.ControllerBusNumber,
 			UnitNumber:          &p.UnitNumber,
 		})
 	}
 
+	return nil
+}
+
+// readyDiskByVolumeName finds the readyDependentDisk for the given
+// vm.spec.volumes[*].name, or false if none matches.
+func readyDiskByVolumeName(ready []readyDependentDisk, volumeName string) (readyDependentDisk, bool) {
+	for _, rd := range ready {
+		if rd.plan.VolumeName == volumeName {
+			return rd, true
+		}
+	}
+	return readyDependentDisk{}, false
+}
+
+// requestDiskPathRefresh sets DiskPathRefreshRequestedAnnotation on the
+// PVC's CsiVolumeInfo, asking CSI's csivolumeinfo controller to re-resolve
+// spec.diskPath from a live query. vm-operator never clears or rewrites
+// spec.diskPath itself here — for a dependent (VMManaged) volume that field
+// being non-empty is a durable invariant vm-operator's own attach path also
+// relies on, so only CSI may touch it; this annotation is the signal.
+func (r *Reconciler) requestDiskPathRefresh(
+	ctx *pkgctx.VolumeContext, vm *vmopv1.VirtualMachine, claimName string) error {
+
+	cvi, err := vmopv1util.GetCVIForPVC(ctx, r.Client, vm.Namespace, claimName)
+	if err != nil {
+		return fmt.Errorf("failed to get CsiVolumeInfo for PVC %s: %w", claimName, err)
+	}
+	if _, alreadyRequested := cvi.Annotations[cnsv1alpha1.DiskPathRefreshRequestedAnnotation]; alreadyRequested {
+		return nil
+	}
+
+	patch := ctrlclient.MergeFrom(cvi.DeepCopy())
+	metav1.SetMetaDataAnnotation(&cvi.ObjectMeta, cnsv1alpha1.DiskPathRefreshRequestedAnnotation, "true")
+	if err := r.Client.Patch(ctx, cvi, patch); err != nil {
+		return fmt.Errorf("failed to set %s on CsiVolumeInfo %s: %w",
+			cnsv1alpha1.DiskPathRefreshRequestedAnnotation, cvi.Name, err)
+	}
+	ctx.Logger.Info("Requested diskPath refresh for stale-attach PVC", "pvc", claimName, "cvi", cvi.Name)
+	return nil
+}
+
+// forceIndependentPersistentDiskMode patches vm.Spec.Volumes[i].DiskMode to
+// IndependentPersistent for the named volume. This is a controller write to
+// spec, the same class of exception convertVKSDiskModes takes (migration
+// §4.5) — required so a workload PVC attached to a VKS node VM is never left
+// in dependent mode, which would let CSI attempt an ownership-transfer
+// unregister on a PVC vm-operator does not own.
+func (r *Reconciler) forceIndependentPersistentDiskMode(
+	ctx *pkgctx.VolumeContext, vm *vmopv1.VirtualMachine, volumeName string) error {
+
+	patch := ctrlclient.MergeFrom(vm.DeepCopy())
+	found := false
+	for i := range vm.Spec.Volumes {
+		if vm.Spec.Volumes[i].Name == volumeName {
+			vm.Spec.Volumes[i].DiskMode = vmopv1.VolumeDiskModeIndependentPersistent
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("volume %s not found in spec.volumes while forcing disk mode", volumeName)
+	}
+	if err := r.Client.Patch(ctx, vm, patch); err != nil {
+		return fmt.Errorf("failed to force independent-persistent disk mode for volume %s: %w", volumeName, err)
+	}
+	ctx.Logger.Info("Forced independent-persistent disk mode for workload PVC on VKS node",
+		"volume", volumeName)
 	return nil
 }
 

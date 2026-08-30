@@ -77,8 +77,8 @@ type funcs struct {
 	GetLiveDiskPathAtSlotFn func(ctx context.Context, vm *vmopv1.VirtualMachine, controllerType vmopv1.VirtualControllerType, controllerBusNumber, unitNumber int32) (string, error)
 	DetachDiskAtSlotFn      func(ctx context.Context, vm *vmopv1.VirtualMachine, controllerType vmopv1.VirtualControllerType, controllerBusNumber, unitNumber int32) (string, error)
 
-	HasAnySnapshotFn                     func(ctx context.Context, vm *vmopv1.VirtualMachine) (bool, error)
-	ConvertDiskToIndependentPersistentFn func(ctx context.Context, vm *vmopv1.VirtualMachine, controllerType vmopv1.VirtualControllerType, controllerBusNumber, unitNumber int32) error
+	HasAnySnapshotFn                      func(ctx context.Context, vm *vmopv1.VirtualMachine) (bool, error)
+	ConvertDisksToIndependentPersistentFn func(ctx context.Context, vm *vmopv1.VirtualMachine, slots []providers.VolumeDiskModeSlot) error
 }
 
 type VMProvider struct {
@@ -570,18 +570,17 @@ func (s *VMProvider) HasAnySnapshot(ctx context.Context, vm *vmopv1.VirtualMachi
 	return false, nil
 }
 
-// ConvertDiskToIndependentPersistent delegates to
-// ConvertDiskToIndependentPersistentFn if set.
-func (s *VMProvider) ConvertDiskToIndependentPersistent(
+// ConvertDisksToIndependentPersistent delegates to
+// ConvertDisksToIndependentPersistentFn if set.
+func (s *VMProvider) ConvertDisksToIndependentPersistent(
 	ctx context.Context,
 	vm *vmopv1.VirtualMachine,
-	controllerType vmopv1.VirtualControllerType,
-	controllerBusNumber, unitNumber int32) error {
+	slots []providers.VolumeDiskModeSlot) error {
 
 	s.Lock()
 	defer s.Unlock()
-	if s.ConvertDiskToIndependentPersistentFn != nil {
-		return s.ConvertDiskToIndependentPersistentFn(ctx, vm, controllerType, controllerBusNumber, unitNumber)
+	if s.ConvertDisksToIndependentPersistentFn != nil {
+		return s.ConvertDisksToIndependentPersistentFn(ctx, vm, slots)
 	}
 	return nil
 }
