@@ -1534,17 +1534,42 @@ func updateVolumeStatus(vmCtx pkgctx.VirtualMachineContext) {
 				}
 			}
 
+			// A non-FCD disk already recorded as Classic may have had its
+			// volume spec populated after the first status write (the
+			// registration race: the disk enters status before
+			// unmanagedvolumes_register adds the PVC-backed spec entry).
+			// Once the spec entry is present, promote the type to Managed so
+			// the status reflects the actual ownership.
+			if !di.FCD && pkgcfg.FromContext(vmCtx).Features.VMOwnedVolumes &&
+				vm.Status.Volumes[diskIndex].Type == vmopv1.VolumeTypeClassic {
+				if vs, ok := info.Volumes[di.Target.String()]; ok &&
+					vs.PersistentVolumeClaim != nil {
+					vm.Status.Volumes[diskIndex].Type = vmopv1.VolumeTypeManaged
+				}
+			}
+
 		} else if !di.FCD {
 
-			var volName string
-			if volSpec, ok := info.Volumes[di.Target.String()]; ok {
-				volName = volSpec.Name
+			var (
+				volName     string
+				isPVCBacked bool
+			)
+			if vs, ok := info.Volumes[di.Target.String()]; ok {
+				volName = vs.Name
+				isPVCBacked = vs.PersistentVolumeClaim != nil
 			} else {
 				volName = pkgutil.GeneratePVCName("disk", di.UUID)
 			}
 
-			// The disk is a classic, non-FCD that must be added to the list
-			// of volume statuses.
+			// When VMOwnedVolumes is on, a non-FCD disk that already maps to a
+			// PVC-backed spec.volumes entry has been imported via
+			// deferFcdRegistration and is managed, not classic.
+			volType := vmopv1.VolumeTypeClassic
+			if pkgcfg.FromContext(vmCtx).Features.VMOwnedVolumes && isPVCBacked {
+				volType = vmopv1.VolumeTypeManaged
+			}
+
+			// The disk is a non-FCD that must be added to the list of volume statuses.
 			ddi, _ := vmdk.GetVirtualDiskInfoByUUID(
 				vmCtx,
 				nil,         /* no client since props aren't re-fetched */
@@ -1555,7 +1580,7 @@ func updateVolumeStatus(vmCtx pkgctx.VirtualMachineContext) {
 
 			volStatus := vmopv1.VirtualMachineVolumeStatus{
 				Name:      volName,
-				Type:      vmopv1.VolumeTypeClassic,
+				Type:      volType,
 				Attached:  true,
 				DiskUUID:  di.UUID,
 				Limit:     kubeutil.BytesToResource(di.CapacityInBytes),
@@ -1590,11 +1615,25 @@ func updateVolumeStatus(vmCtx pkgctx.VirtualMachineContext) {
 	}
 
 	// Remove any status entries for classic disks that no longer exist in
-	// config.hardware.device.
+	// config.hardware.device. Managed disks get the same treatment once they
+	// have a DiskUUID: a migration-driven FCD unregister/re-register (VM-owned
+	// volumes) assigns a disk a new DiskUUID, and the name-based dedup above
+	// only fires when the live DiskUUID still matches an existing entry — so
+	// without this, the pre-migration entry (already promoted to Managed by
+	// the registration-race handling above) would never be pruned and would
+	// permanently duplicate the fresh, correctly-named entry for the same
+	// physical disk. A Managed entry with an empty DiskUUID (not yet attached)
+	// is left alone.
 	vm.Status.Volumes = slices.DeleteFunc(vm.Status.Volumes,
 		func(e vmopv1.VirtualMachineVolumeStatus) bool {
 			switch e.Type {
 			case vmopv1.VolumeTypeClassic:
+				_, keep := existingDisksInConfig[e.DiskUUID]
+				return !keep
+			case vmopv1.VolumeTypeManaged:
+				if e.DiskUUID == "" {
+					return false
+				}
 				_, keep := existingDisksInConfig[e.DiskUUID]
 				return !keep
 			default:

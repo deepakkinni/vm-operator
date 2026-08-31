@@ -125,6 +125,25 @@ const (
 	// The value is the reason for the restart.
 	LastRestartReasonAnnotationKey = "vmoperator.vmware.com/last-restart-reason"
 
+	// StaleDiskPathAnnotationKey is applied by the volumeattachdetach
+	// controller to a CsiVolumeInfo, recording the spec.diskPath value that
+	// was found stale when a diskPath refresh was requested for it.
+	//
+	// It exists to make the refresh request one-shot per path. CSI cannot
+	// always produce a new value: for a dependent volume it resolves the path
+	// from the VM's own device list, which by definition cannot answer while
+	// the disk is detached — and the refresh is requested precisely because an
+	// attach just failed. CSI therefore clears the refresh annotation having
+	// kept the recorded path, and without this record vm-operator would see a
+	// cleared annotation, retry the same path, fail again, and request another
+	// refresh, indefinitely.
+	//
+	// Comparing this value against the current spec.diskPath after a refresh
+	// completes distinguishes "CSI produced a new path, retry is worthwhile"
+	// from "CSI returned the same path, retrying cannot help" — the latter
+	// being a permanent condition to surface rather than spin on.
+	StaleDiskPathAnnotationKey = "vmoperator.vmware.com/stale-diskpath"
+
 	// VCCredsSecretName is the name of the secret in the pod namespace
 	// that contains the VC credentials.
 	VCCredsSecretName = "wcp-vmop-sa-vc-auth" //nolint:gosec
@@ -261,4 +280,39 @@ const (
 	// PVCEncryptionClassNameAnnotation specifies the name of an EncryptionClass
 	// on a PVC.
 	PVCEncryptionClassNameAnnotation = "csi.vsphere.encryption-class"
+
+	// PVCFastProvisioningAnnotation marks a PVC as a linked-clone
+	// ("fast provisioning") volume, backed by a disk that shares a chain
+	// with its parent FCD.
+	PVCFastProvisioningAnnotation = "csi.vsphere.volume/fast-provisioning"
+
+	// VMOwnedVolumesAnnotation is set on a VirtualMachine at creation time when
+	// the VMOwnedVolumes feature gate is enabled. Its presence identifies the VM
+	// as a VM-owned-volumes VM that uses the CsiVolumeInfo-based volume ownership path
+	// for attach/detach operations.
+	VMOwnedVolumesAnnotation = "vmoperator.vmware.com/vm-owned-volumes"
+
+	// CVICleanupFinalizer is placed on VM-owned-volumes VMs to ensure CsiVolumeInfo
+	// entries referencing the VM are cleaned up before the VM CR is deleted.
+	CVICleanupFinalizer = "vmoperator.vmware.com/cvi-cleanup"
+
+	// MigrateToVMOwnedAnnotation is the explicit, user-set trigger for
+	// migrating a brownfield VM onto the VM-owned-volumes path (migration
+	// §4.2).
+	MigrateToVMOwnedAnnotation = "vmoperator.vmware.com/migrate-to-vm-owned"
+
+	// VMOwnedMigrationAnnotation records the in-progress/complete state of a
+	// VM's migration onto the VM-owned-volumes path, set on the VM's
+	// CnsNodeVMBatchAttachment (migration §6.3).
+	VMOwnedMigrationAnnotation = "cns.vmware.com/vm-owned-migration"
+
+	// VMOwnedMigrationInProgress is the VMOwnedMigrationAnnotation value while
+	// a VM's disks are being moved onto the CsiVolumeInfo path. CSI's BA
+	// controller returns early while it is present.
+	VMOwnedMigrationInProgress = "InProgress"
+
+	// VMOwnedMigrationComplete is the VMOwnedMigrationAnnotation value once
+	// every disk has been confirmed on the CsiVolumeInfo path and the BA has
+	// been retired.
+	VMOwnedMigrationComplete = "Complete"
 )

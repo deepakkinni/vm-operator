@@ -18,6 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
+	backupapi "github.com/vmware-tanzu/vm-operator/pkg/backup/api"
 	pkgcond "github.com/vmware-tanzu/vm-operator/pkg/conditions"
 	pkgcfg "github.com/vmware-tanzu/vm-operator/pkg/config"
 	"github.com/vmware-tanzu/vm-operator/pkg/constants"
@@ -259,6 +260,26 @@ func (r *Reconciler) ReconcileDelete(ctx *pkgctx.VirtualMachineSnapshotContext) 
 
 	ctx.VM = vm
 
+	// For VM-owned-volumes VMs, read the snapshot's PVC disk data BEFORE the vSphere
+	// snapshot is deleted, since the ExtraConfig lives on the snapshot object.
+	var pvcDisks []backupapi.PVCDiskData
+	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes && vmopv1util.HasVMOwnedVolumesAnnotation(vm) {
+		var readErr error
+		pvcDisks, readErr = r.VMProvider.GetPVCDiskDataFromSnapshot(ctx.Context, vm, vmSnapshot.Name)
+		if readErr != nil {
+			ctx.Logger.Error(readErr, "Failed to read PVC disk data from snapshot before deletion")
+			// Non-fatal: proceed; CVI entries won't be cleaned up this cycle.
+		}
+
+		// D.2: Refresh each CVI's spec.diskPath from the snapshot's hardware
+		// device config BEFORE deleting the snapshot. This resolves any
+		// redo-log delta suffix and ensures CSI receives the registerable base
+		// VMDK path when it re-registers the disk after this snapshot is gone.
+		if len(pvcDisks) > 0 {
+			r.refreshCVIDiskPathsFromSnapshot(ctx, vm, pvcDisks)
+		}
+	}
+
 	// delete snapshot from the VM
 	vmNotFound, err := r.deleteSnapshot(ctx)
 	if err != nil {
@@ -269,6 +290,14 @@ func (r *Reconciler) ReconcileDelete(ctx *pkgctx.VirtualMachineSnapshotContext) 
 			" snapshot is deleted along with moVM, remove finalizer")
 		controllerutil.RemoveFinalizer(vmSnapshot, Finalizer)
 		return nil
+	}
+
+	// After the vSphere snapshot is gone, evaluate CVI entries for volumes
+	// that were retained solely by this snapshot.
+	if pkgcfg.FromContext(ctx).Features.VMOwnedVolumes && vmopv1util.HasVMOwnedVolumesAnnotation(vm) && len(pvcDisks) > 0 {
+		if err := r.reconcileOwnedVolumeSnapshotDeletion(ctx, pvcDisks); err != nil {
+			return fmt.Errorf("failed to evaluate vm-owned-volumes CVI entries after snapshot deletion: %w", err)
+		}
 	}
 
 	if err := r.syncVMSSnapshotTreeStatus(ctx); err != nil {

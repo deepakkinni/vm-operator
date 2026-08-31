@@ -125,6 +125,10 @@ func init() {
 		"create.vmoperator.vmware.com/set-default-controllers",
 		(MutateOnCreateFn)(SetDefaultControllers))
 
+	MutateOnCreateFuncs.Store(
+		"create.vmoperator.vmware.com/set-vm-owned-volumes-annotation",
+		(MutateOnCreateFn)(SetVMOwnedVolumesAnnotation))
+
 	MutateOnUpdateFuncs.Store(
 		"update.vmoperator.vmware.com/set-default-cdrom-image-kind",
 		(MutateOnUpdateFn)(SetDefaultCdromImgKindOnUpdate))
@@ -793,6 +797,25 @@ func ResolveImageNameOnCreate(
 	}
 
 	return false, nil
+}
+
+// SetVMOwnedVolumesAnnotation stamps the VMOwnedVolumesAnnotation on a new VM
+// when the VMOwnedVolumes feature gate is enabled. Its presence marks the VM as
+// a VM-owned-volumes VM that uses the CsiVolumeInfo-based volume ownership path for
+// attach/detach operations.
+func SetVMOwnedVolumesAnnotation(
+	ctx *pkgctx.WebhookRequestContext,
+	_ ctrlclient.Client,
+	vm *vmopv1.VirtualMachine) (_ bool, _ error) {
+
+	if !pkgcfg.FromContext(ctx).Features.VMOwnedVolumes {
+		return false, nil
+	}
+	if vm.Annotations == nil {
+		vm.Annotations = map[string]string{}
+	}
+	vm.Annotations[constants.VMOwnedVolumesAnnotation] = "true"
+	return true, nil
 }
 
 func SetCreatedAtAnnotations(

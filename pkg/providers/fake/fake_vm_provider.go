@@ -19,6 +19,7 @@ import (
 	infrav1 "github.com/vmware-tanzu/vm-operator/external/infra/api/v1alpha1"
 
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
+	backupapi "github.com/vmware-tanzu/vm-operator/pkg/backup/api"
 	pkgcfg "github.com/vmware-tanzu/vm-operator/pkg/config"
 	"github.com/vmware-tanzu/vm-operator/pkg/providers"
 	vsclient "github.com/vmware-tanzu/vm-operator/pkg/util/vsphere/client"
@@ -67,6 +68,17 @@ type funcs struct {
 	DeleteSnapshotFn           func(ctx context.Context, vmSnapshot *vmopv1.VirtualMachineSnapshot, vm *vmopv1.VirtualMachine, removeChildren bool, consolidate *bool) (bool, error)
 	GetSnapshotSizeFn          func(ctx context.Context, vmSnapshotName string, vm *vmopv1.VirtualMachine) (int64, error)
 	SyncVMSnapshotTreeStatusFn func(ctx context.Context, vm *vmopv1.VirtualMachine) error
+
+	GetPVCDiskDataFromSnapshotFn  func(ctx context.Context, vm *vmopv1.VirtualMachine, snapshotName string) ([]backupapi.PVCDiskData, error)
+	IsDiskRetainedByAnySnapshotFn func(ctx context.Context, vm *vmopv1.VirtualMachine, diskUUID string) (bool, error)
+	GetDiskPathFromSnapshotFn     func(ctx context.Context, vm *vmopv1.VirtualMachine, snapshotName, diskUUID string) (string, error)
+
+	AttachVolumeDisksFn     func(ctx context.Context, vm *vmopv1.VirtualMachine, disks []providers.VolumeDiskAddSpec) ([]providers.VolumeDiskPlacement, error)
+	GetLiveDiskPathAtSlotFn func(ctx context.Context, vm *vmopv1.VirtualMachine, controllerType vmopv1.VirtualControllerType, controllerBusNumber, unitNumber int32) (string, error)
+	DetachDiskAtSlotFn      func(ctx context.Context, vm *vmopv1.VirtualMachine, controllerType vmopv1.VirtualControllerType, controllerBusNumber, unitNumber int32) (string, error)
+
+	HasAnySnapshotFn                      func(ctx context.Context, vm *vmopv1.VirtualMachine) (bool, error)
+	ConvertDisksToIndependentPersistentFn func(ctx context.Context, vm *vmopv1.VirtualMachine, slots []providers.VolumeDiskModeSlot) error
 }
 
 type VMProvider struct {
@@ -482,6 +494,115 @@ func (s *VMProvider) SyncVMSnapshotTreeStatus(ctx context.Context, vm *vmopv1.Vi
 		return s.SyncVMSnapshotTreeStatusFn(ctx, vm)
 	}
 	return nil
+}
+
+// DetachDiskAtSlot is a no-op stub for the fake provider.
+func (s *VMProvider) DetachDiskAtSlot(
+	ctx context.Context,
+	vm *vmopv1.VirtualMachine,
+	controllerType vmopv1.VirtualControllerType,
+	controllerBusNumber, unitNumber int32) (string, error) {
+
+	s.Lock()
+	defer s.Unlock()
+	if s.DetachDiskAtSlotFn != nil {
+		return s.DetachDiskAtSlotFn(ctx, vm, controllerType, controllerBusNumber, unitNumber)
+	}
+	return "", nil
+}
+
+// AttachVolumeDisks delegates to AttachVolumeDisksFn if set, otherwise
+// returns a placement for every disk with no controller/UUID info filled in.
+func (s *VMProvider) AttachVolumeDisks(
+	ctx context.Context,
+	vm *vmopv1.VirtualMachine,
+	disks []providers.VolumeDiskAddSpec) ([]providers.VolumeDiskPlacement, error) {
+
+	s.Lock()
+	defer s.Unlock()
+	if s.AttachVolumeDisksFn != nil {
+		return s.AttachVolumeDisksFn(ctx, vm, disks)
+	}
+	placements := make([]providers.VolumeDiskPlacement, len(disks))
+	for i, d := range disks {
+		placements[i] = providers.VolumeDiskPlacement{VolumeName: d.VolumeName}
+	}
+	return placements, nil
+}
+
+// GetPVCDiskDataFromSnapshot delegates to GetPVCDiskDataFromSnapshotFn if set.
+func (s *VMProvider) GetPVCDiskDataFromSnapshot(ctx context.Context, vm *vmopv1.VirtualMachine, snapshotName string) ([]backupapi.PVCDiskData, error) {
+	s.Lock()
+	defer s.Unlock()
+	if s.GetPVCDiskDataFromSnapshotFn != nil {
+		return s.GetPVCDiskDataFromSnapshotFn(ctx, vm, snapshotName)
+	}
+	return nil, nil
+}
+
+// GetDiskPathAtSlot is a no-op stub for the fake provider.
+func (s *VMProvider) GetDiskPathAtSlot(_ context.Context, _ *vmopv1.VirtualMachine, _ vmopv1.VirtualControllerType, _, _ int32) (string, error) {
+	return "", nil
+}
+
+// GetLiveDiskPathAtSlot delegates to GetLiveDiskPathAtSlotFn if set.
+func (s *VMProvider) GetLiveDiskPathAtSlot(
+	ctx context.Context,
+	vm *vmopv1.VirtualMachine,
+	controllerType vmopv1.VirtualControllerType,
+	controllerBusNumber, unitNumber int32) (string, error) {
+
+	s.Lock()
+	defer s.Unlock()
+	if s.GetLiveDiskPathAtSlotFn != nil {
+		return s.GetLiveDiskPathAtSlotFn(ctx, vm, controllerType, controllerBusNumber, unitNumber)
+	}
+	return "", nil
+}
+
+// HasAnySnapshot delegates to HasAnySnapshotFn if set.
+func (s *VMProvider) HasAnySnapshot(ctx context.Context, vm *vmopv1.VirtualMachine) (bool, error) {
+	s.Lock()
+	defer s.Unlock()
+	if s.HasAnySnapshotFn != nil {
+		return s.HasAnySnapshotFn(ctx, vm)
+	}
+	return false, nil
+}
+
+// ConvertDisksToIndependentPersistent delegates to
+// ConvertDisksToIndependentPersistentFn if set.
+func (s *VMProvider) ConvertDisksToIndependentPersistent(
+	ctx context.Context,
+	vm *vmopv1.VirtualMachine,
+	slots []providers.VolumeDiskModeSlot) error {
+
+	s.Lock()
+	defer s.Unlock()
+	if s.ConvertDisksToIndependentPersistentFn != nil {
+		return s.ConvertDisksToIndependentPersistentFn(ctx, vm, slots)
+	}
+	return nil
+}
+
+// IsDiskRetainedByAnySnapshot delegates to IsDiskRetainedByAnySnapshotFn if set.
+func (s *VMProvider) IsDiskRetainedByAnySnapshot(ctx context.Context, vm *vmopv1.VirtualMachine, diskUUID string) (bool, error) {
+	s.Lock()
+	defer s.Unlock()
+	if s.IsDiskRetainedByAnySnapshotFn != nil {
+		return s.IsDiskRetainedByAnySnapshotFn(ctx, vm, diskUUID)
+	}
+	return false, nil
+}
+
+// GetDiskPathFromSnapshot delegates to GetDiskPathFromSnapshotFn if set.
+func (s *VMProvider) GetDiskPathFromSnapshot(ctx context.Context, vm *vmopv1.VirtualMachine, snapshotName, diskUUID string) (string, error) {
+	s.Lock()
+	defer s.Unlock()
+	if s.GetDiskPathFromSnapshotFn != nil {
+		return s.GetDiskPathFromSnapshotFn(ctx, vm, snapshotName, diskUUID)
+	}
+	return "", nil
 }
 
 func NewVMProvider() *VMProvider {

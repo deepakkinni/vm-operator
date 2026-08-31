@@ -143,6 +143,7 @@ nav:
     - VirtualMachineGroup: concepts/workloads/vm-group.md
     - Policies: concepts/workloads/vsphere-policies.md
     - VirtualMachineSnapshot: concepts/workloads/vm-snapshot.md
+    - VM-Owned Volumes: concepts/workloads/vm-owned-volumes.md
   - Images:
     - concepts/images/README.md
     - VirtualMachineImage: concepts/images/vm-image.md

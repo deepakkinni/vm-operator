@@ -20,12 +20,16 @@ import (
 
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
 	"github.com/vmware-tanzu/vm-operator/controllers/virtualmachinesnapshot"
+	cnsv1alpha1 "github.com/vmware-tanzu/vm-operator/external/vsphere-csi-driver/api/v1alpha1"
+	backupapi "github.com/vmware-tanzu/vm-operator/pkg/backup/api"
 	"github.com/vmware-tanzu/vm-operator/pkg/conditions"
+	pkgcfg "github.com/vmware-tanzu/vm-operator/pkg/config"
 	"github.com/vmware-tanzu/vm-operator/pkg/constants"
 	"github.com/vmware-tanzu/vm-operator/pkg/constants/testlabels"
 	providerfake "github.com/vmware-tanzu/vm-operator/pkg/providers/fake"
 	"github.com/vmware-tanzu/vm-operator/pkg/util/kube/cource"
 	"github.com/vmware-tanzu/vm-operator/pkg/util/ptr"
+	vmopv1util "github.com/vmware-tanzu/vm-operator/pkg/util/vmopv1"
 	"github.com/vmware-tanzu/vm-operator/test/builder"
 )
 
@@ -37,6 +41,14 @@ func unitTests() {
 			testlabels.API,
 		),
 		unitTestsReconcile,
+	)
+	Describe(
+		"ReconcileDelete – vm-owned-volumes D.2 diskPath refresh",
+		Label(
+			testlabels.Controller,
+			testlabels.API,
+		),
+		unitTestsOwnedVolumesDiskPathRefresh,
 	)
 }
 
@@ -723,6 +735,205 @@ func unitTestsReconcile() {
 					Expect(vmSnapshotL2Obj.Status.Children).To(HaveLen(1))
 					Expect(vmSnapshotL2Obj.Status.Children).To(ContainElement(*vmSnapshotCRToManagedSnapshotRefWithDefaultVersion(vmSnapshotL3Node2)))
 				})
+			})
+		})
+	})
+}
+
+// unitTestsOwnedVolumesDiskPathRefresh exercises the D.2 spec requirement:
+// before a vSphere snapshot is deleted, the CVI spec.diskPath must be
+// refreshed from the snapshot's device config so CSI receives a registerable
+// base-disk path (not a redo-log delta).
+func unitTestsOwnedVolumesDiskPathRefresh() {
+	const (
+		ns        = "test-namespace"
+		vmName    = "dummy-vm"
+		snapName  = "snap-2"
+		pvcName   = "pvc-test-1"
+		pvName    = "pv-test-1"
+		volumeID  = "cns-volume-id-999" // the CNS volume ID — distinct from diskUUID
+		diskUUID  = "6000C29-abc"       // the VirtualDisk backing UUID, NOT the CNS volume ID
+		deltaPath = "[ds] vm/pvc-test-1-000001.vmdk"
+		basePath  = "[ds] vm/pvc-test-1.vmdk"
+	)
+
+	var (
+		initObjects    []client.Object
+		ctx            *builder.UnitTestContextForController
+		reconciler     *virtualmachinesnapshot.Reconciler
+		fakeVMProvider *providerfake.VMProvider
+		vm             *vmopv1.VirtualMachine
+		vmSnapshot     *vmopv1.VirtualMachineSnapshot
+		cvi            *cnsv1alpha1.CsiVolumeInfo
+	)
+
+	BeforeEach(func() {
+		now := metav1.Now()
+
+		vm = builder.DummyBasicVirtualMachine(vmName, ns)
+		vm.Status.UniqueID = "vm-unique-id"
+		if vm.Annotations == nil {
+			vm.Annotations = map[string]string{}
+		}
+		vm.Annotations[constants.VMOwnedVolumesAnnotation] = "true"
+
+		vmSnapshot = builder.DummyVirtualMachineSnapshot(ns, snapName, vmName)
+		vmSnapshot.DeletionTimestamp = &now
+
+		// The CVI is resolved via PVCName -> PV -> volumeHandle (§4.2.1), not
+		// by diskUUID — diskUUID is only the VirtualDisk backing UUID used to
+		// pick the right device out of the snapshot's saved config.
+		pvc := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: pvcName, Namespace: ns},
+			Spec:       corev1.PersistentVolumeClaimSpec{VolumeName: pvName},
+		}
+		pv := &corev1.PersistentVolume{
+			ObjectMeta: metav1.ObjectMeta{Name: pvName},
+			Spec: corev1.PersistentVolumeSpec{
+				PersistentVolumeSource: corev1.PersistentVolumeSource{
+					CSI: &corev1.CSIPersistentVolumeSource{VolumeHandle: volumeID},
+				},
+			},
+		}
+
+		cvi = &cnsv1alpha1.CsiVolumeInfo{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      vmopv1util.CVINameForVolumeID(volumeID),
+				Namespace: cnsv1alpha1.CVINamespace,
+			},
+			Spec: cnsv1alpha1.CsiVolumeInfoSpec{
+				VolumeID:     volumeID,
+				PVCName:      pvcName,
+				PVCNamespace: ns,
+				DiskPath:     deltaPath, // stale delta path — this is the bug state
+				VMs: []cnsv1alpha1.VirtualMachineRef{
+					{VMName: vmName},
+				},
+			},
+		}
+
+		initObjects = []client.Object{vm, vmSnapshot, pvc, pv, cvi}
+	})
+
+	JustBeforeEach(func() {
+		ctx = suite.NewUnitTestContextForController(initObjects...)
+		fakeVMProvider = ctx.VMProvider.(*providerfake.VMProvider)
+
+		// Enable the vm-owned-volumes feature gate.
+		pkgcfg.SetContext(ctx, func(config *pkgcfg.Config) {
+			config.Features.VMOwnedVolumes = true
+		})
+
+		reconciler = virtualmachinesnapshot.NewReconciler(
+			ctx,
+			ctx.Client,
+			ctx.Logger,
+			ctx.Recorder,
+			ctx.VMProvider,
+		)
+	})
+
+	AfterEach(func() {
+		ctx.AfterEach()
+		ctx = nil
+		initObjects = nil
+		reconciler = nil
+	})
+
+	When("the deleting snapshot has a PVC-backed disk", func() {
+		JustBeforeEach(func() {
+			fakeVMProvider.GetPVCDiskDataFromSnapshotFn = func(
+				_ context.Context, _ *vmopv1.VirtualMachine, _ string,
+			) ([]backupapi.PVCDiskData, error) {
+				return []backupapi.PVCDiskData{
+					{PVCName: pvcName, UUID: diskUUID, FileName: deltaPath},
+				}, nil
+			}
+		})
+
+		When("GetDiskPathFromSnapshot returns the base path", func() {
+			JustBeforeEach(func() {
+				fakeVMProvider.GetDiskPathFromSnapshotFn = func(
+					_ context.Context, _ *vmopv1.VirtualMachine, _, _ string,
+				) (string, error) {
+					return basePath, nil
+				}
+			})
+
+			It("patches CVI.spec.diskPath to the base path before deleteSnapshot", func() {
+				_, err := reconciler.Reconcile(
+					cource.WithContext(ctx),
+					reconcile.Request{NamespacedName: types.NamespacedName{
+						Namespace: vmSnapshot.Namespace,
+						Name:      vmSnapshot.Name,
+					}})
+				Expect(err).ToNot(HaveOccurred())
+
+				updated := &cnsv1alpha1.CsiVolumeInfo{}
+				Expect(ctx.Client.Get(ctx,
+					types.NamespacedName{
+						Namespace: cnsv1alpha1.CVINamespace,
+						Name:      vmopv1util.CVINameForVolumeID(volumeID),
+					}, updated)).To(Succeed())
+				Expect(updated.Spec.DiskPath).To(Equal(basePath))
+			})
+		})
+
+		When("GetDiskPathFromSnapshot returns an error", func() {
+			JustBeforeEach(func() {
+				fakeVMProvider.GetDiskPathFromSnapshotFn = func(
+					_ context.Context, _ *vmopv1.VirtualMachine, _, _ string,
+				) (string, error) {
+					return "", errors.New("vCenter unavailable")
+				}
+			})
+
+			It("proceeds with deletion without patching CVI, leaving diskPath unchanged", func() {
+				_, err := reconciler.Reconcile(
+					cource.WithContext(ctx),
+					reconcile.Request{NamespacedName: types.NamespacedName{
+						Namespace: vmSnapshot.Namespace,
+						Name:      vmSnapshot.Name,
+					}})
+				Expect(err).ToNot(HaveOccurred())
+
+				updated := &cnsv1alpha1.CsiVolumeInfo{}
+				Expect(ctx.Client.Get(ctx,
+					types.NamespacedName{
+						Namespace: cnsv1alpha1.CVINamespace,
+						Name:      vmopv1util.CVINameForVolumeID(volumeID),
+					}, updated)).To(Succeed())
+				// DiskPath must not have been updated on error.
+				Expect(updated.Spec.DiskPath).To(Equal(deltaPath))
+			})
+		})
+
+		When("disk UUID is empty", func() {
+			JustBeforeEach(func() {
+				fakeVMProvider.GetPVCDiskDataFromSnapshotFn = func(
+					_ context.Context, _ *vmopv1.VirtualMachine, _ string,
+				) ([]backupapi.PVCDiskData, error) {
+					return []backupapi.PVCDiskData{
+						{PVCName: pvcName, UUID: "", FileName: deltaPath},
+					}, nil
+				}
+				fakeVMProvider.GetDiskPathFromSnapshotFn = func(
+					_ context.Context, _ *vmopv1.VirtualMachine, _, _ string,
+				) (string, error) {
+					// This must NOT be called for an empty UUID.
+					Fail("GetDiskPathFromSnapshot must not be called when UUID is empty")
+					return "", nil
+				}
+			})
+
+			It("skips the refresh without calling GetDiskPathFromSnapshot", func() {
+				_, err := reconciler.Reconcile(
+					cource.WithContext(ctx),
+					reconcile.Request{NamespacedName: types.NamespacedName{
+						Namespace: vmSnapshot.Namespace,
+						Name:      vmSnapshot.Name,
+					}})
+				Expect(err).ToNot(HaveOccurred())
 			})
 		})
 	})

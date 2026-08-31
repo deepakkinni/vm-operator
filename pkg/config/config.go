@@ -206,6 +206,7 @@ type FeatureStates struct {
 	PerNamespaceNetworkProvider bool
 	WorkloadIPv6                bool
 	VirtualMachineConfigPolicy  bool
+	VMOwnedVolumes              bool // FSS_WCP_VM_OWNED_VOLUMES
 }
 
 type InstanceStorage struct {

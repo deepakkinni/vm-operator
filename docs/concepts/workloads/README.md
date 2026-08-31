@@ -14,6 +14,7 @@ This section provides information about workload resources, such as:
 * [`VirtualMachineGroup`](./vm-group.md)
 * [`VirtualMachineSnapshot`](./vm-snapshot.md)
 * [`WebConsoleRequest`](./vm-web-console.md)
+* [VM-Owned Volumes](./vm-owned-volumes.md)
 
 In addition to the workload resources themselves, there is documentation related to broader topics related to workloads:
 

@@ -2,7 +2,7 @@
 // The term "Broadcom" refers to Broadcom Inc. and/or its subsidiaries.
 // SPDX-License-Identifier: Apache-2.0
 
-package volumebatch_test
+package volumeattachdetach_test
 
 import (
 	"context"
@@ -28,8 +28,9 @@ import (
 	"github.com/vmware-tanzu/vm-operator/test/builder"
 
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha6"
-	"github.com/vmware-tanzu/vm-operator/controllers/virtualmachine/volumebatch"
+	"github.com/vmware-tanzu/vm-operator/controllers/virtualmachine/volumeattachdetach"
 	pkgcfg "github.com/vmware-tanzu/vm-operator/pkg/config"
+	pkgconst "github.com/vmware-tanzu/vm-operator/pkg/constants"
 	"github.com/vmware-tanzu/vm-operator/pkg/constants/testlabels"
 	pkgctx "github.com/vmware-tanzu/vm-operator/pkg/context"
 	providerfake "github.com/vmware-tanzu/vm-operator/pkg/providers/fake"
@@ -62,7 +63,7 @@ func unitTestsReconcile() {
 		detachingVolumeSuffix = ":detaching"
 	)
 	var (
-		reconciler     *volumebatch.Reconciler
+		reconciler     *volumeattachdetach.Reconciler
 		initObjects    []client.Object
 		withFuncs      interceptor.Funcs
 		ctx            *builder.UnitTestContextForController
@@ -169,7 +170,7 @@ func unitTestsReconcile() {
 				}).
 			Build()
 
-		reconciler = volumebatch.NewReconciler(
+		reconciler = volumeattachdetach.NewReconciler(
 			ctx,
 			ctx.Client,
 			ctx.Logger,
@@ -249,6 +250,56 @@ func unitTestsReconcile() {
 				By("Did not create CnsNodeVMBatchAttachment", func() {
 					Expect(getCNSBatchAttachmentForVolumeName(ctx, vm)).To(BeNil())
 					Expect(vm.Status.Volumes).To(BeEmpty())
+				})
+			})
+		})
+
+		When("VM has vm-owned-volumes annotation and VMOwnedVolumes feature gate is enabled", func() {
+			BeforeEach(func() {
+				vm.Annotations = map[string]string{
+					pkgconst.VMOwnedVolumesAnnotation: "true",
+				}
+				vm.Spec.Volumes = append(vm.Spec.Volumes, *vmVolumeWithPVC1)
+				initObjects = append(initObjects, boundPVC1)
+			})
+
+			JustBeforeEach(func() {
+				pkgcfg.SetContext(ctx, func(config *pkgcfg.Config) {
+					config.Features.VMOwnedVolumes = true
+				})
+			})
+
+			It("skips batch attachment and returns success", func() {
+				err := reconciler.ReconcileNormal(volCtx)
+				Expect(err).ToNot(HaveOccurred())
+
+				By("Did not create CnsNodeVMBatchAttachment", func() {
+					Expect(getCNSBatchAttachmentForVolumeName(ctx, vm)).To(BeNil())
+				})
+			})
+		})
+
+		When("VM has vm-owned-volumes annotation but VMOwnedVolumes feature gate is disabled", func() {
+			BeforeEach(func() {
+				vm.Annotations = map[string]string{
+					pkgconst.VMOwnedVolumesAnnotation: "true",
+				}
+				vm.Spec.Volumes = append(vm.Spec.Volumes, *vmVolumeWithPVC1)
+				initObjects = append(initObjects, boundPVC1)
+			})
+
+			JustBeforeEach(func() {
+				pkgcfg.SetContext(ctx, func(config *pkgcfg.Config) {
+					config.Features.VMOwnedVolumes = false
+				})
+			})
+
+			It("still creates a CnsNodeVMBatchAttachment (annotation ignored without feature gate)", func() {
+				err := reconciler.ReconcileNormal(volCtx)
+				Expect(err).ToNot(HaveOccurred())
+
+				By("CnsNodeVMBatchAttachment was created", func() {
+					Expect(getCNSBatchAttachmentForVolumeName(ctx, vm)).ToNot(BeNil())
 				})
 			})
 		})
@@ -620,7 +671,7 @@ func unitTestsReconcile() {
 					legacyAttachment1.Spec.VolumeName = legacyPVCName1
 					// Add a volume that matches legacy attachment
 					legacyAttachment1.Status.Attached = false
-					legacyAttachment1.Status.Error = volumebatch.CNSNodeVMAttachmentDeprecatedErrorMsg
+					legacyAttachment1.Status.Error = volumeattachdetach.CNSNodeVMAttachmentDeprecatedErrorMsg
 
 					vm.Spec.Volumes = append(vm.Spec.Volumes, *vmVolWithLegacy1)
 					initObjects = append(initObjects, legacyAttachment1, legacyAttachment2, legacyPVC1)
@@ -639,7 +690,7 @@ func unitTestsReconcile() {
 					// Just expect that the error has been reflected in the status. This situation is
 					// a little different in that it kind of is :detaching, but it is still in the spec.
 					Expect(vm.Status.Volumes).To(HaveLen(1))
-					Expect(vm.Status.Volumes[0].Error).To(Equal(volumebatch.CNSNodeVMAttachmentDeprecatedErrorMsg))
+					Expect(vm.Status.Volumes[0].Error).To(Equal(volumeattachdetach.CNSNodeVMAttachmentDeprecatedErrorMsg))
 
 					err = reconciler.ReconcileNormal(volCtx)
 					Expect(err).ToNot(HaveOccurred())
@@ -871,7 +922,7 @@ func unitTestsReconcile() {
 					initObjects = append(initObjects, legacyAttachment1, legacyPVC1)
 				})
 
-				It("should treat volume as greenfield and create batch attachment", func() {
+				It("should treat volume as vm-owned-volumes and create batch attachment", func() {
 					err := reconciler.ReconcileNormal(volCtx)
 					Expect(err).ToNot(HaveOccurred())
 

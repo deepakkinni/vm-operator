@@ -32,6 +32,8 @@ Each spec lives under `specs/NNN-slug/`. Standard artifacts: `spec.md` (behavior
 |---|------|-------|--------|------|
 | 000 | [sdd](specs/000-sdd/) | VM Operator Specification Driven Development | In Progress | vmop-3820 |
 | 001 | [class-policy-resize](specs/001-class-policy-resize/) | VM Service Class Policy and Resize — Policy + Environment Browser Pipeline | In Progress | vmop-3331 |
+| 002 | [vm-owned-volumes](specs/002-vm-owned-volumes/) | VM-Owned Volume Attach/Detach — route every PVC-backed disk mode through CsiVolumeInfo, no CnsNodeVMBatchAttachment | Implemented (attach/detach; migration is a follow-on) | vmop-TBD |
+| 003 | [vm-owned-volumes-migration](specs/003-vm-owned-volumes-migration/) | VM-Owned Volume Brownfield Migration — convert a brownfield VM's existing disks onto the CsiVolumeInfo path in place, VKS disk-mode conversion | Implemented | vmop-TBD |
 
 ### Finding the right spec
 

@@ -24,6 +24,7 @@ rules:
   resources:
   - namespaces
   - nodes
+  - persistentvolumes
   - resourcequotas
   - secrets
   verbs:
@@ -111,6 +112,17 @@ rules:
   - create
   - delete
   - deletecollection
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - cns.vmware.com
+  resources:
+  - csivolumeinfos
+  verbs:
+  - create
   - get
   - list
   - patch

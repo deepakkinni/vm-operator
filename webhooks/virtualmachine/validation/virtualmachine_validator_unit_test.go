@@ -36,6 +36,7 @@ import (
 	"github.com/vmware-tanzu/vm-operator/api/v1alpha6/common"
 	"github.com/vmware-tanzu/vm-operator/api/v1alpha6/sysprep"
 	topologyv1 "github.com/vmware-tanzu/vm-operator/external/tanzu-topology/api/v1alpha1"
+	cnsv1alpha1 "github.com/vmware-tanzu/vm-operator/external/vsphere-csi-driver/api/v1alpha1"
 	pkgbuilder "github.com/vmware-tanzu/vm-operator/pkg/builder"
 	pkgcfg "github.com/vmware-tanzu/vm-operator/pkg/config"
 	pkgconst "github.com/vmware-tanzu/vm-operator/pkg/constants"
@@ -5598,6 +5599,54 @@ func unitTestsValidateUpdate() { //nolint:gocyclo
 						`metadata.annotations[vsphere-cluster-module-group]: Forbidden: modifying this annotation is not allowed for non-admin users`),
 				},
 			),
+			Entry("should disallow changing the VMOwnedVolumes annotation once set, by SSO user",
+				testParams{
+					setup: func(ctx *unitValidatingWebhookContext) {
+						ctx.oldVM.Annotations[pkgconst.VMOwnedVolumesAnnotation] = "true"
+						ctx.vm.Annotations[pkgconst.VMOwnedVolumesAnnotation] = "false"
+					},
+					validate: doValidateWithMsg(
+						field.Forbidden(annotationPath.Key(pkgconst.VMOwnedVolumesAnnotation), "modifying this annotation is not allowed for non-admin users").Error()),
+				},
+			),
+			Entry("should disallow removing the VMOwnedVolumes annotation once set, by SSO user",
+				testParams{
+					setup: func(ctx *unitValidatingWebhookContext) {
+						ctx.oldVM.Annotations[pkgconst.VMOwnedVolumesAnnotation] = "true"
+						delete(ctx.vm.Annotations, pkgconst.VMOwnedVolumesAnnotation)
+					},
+					validate: doValidateWithMsg(
+						field.Forbidden(annotationPath.Key(pkgconst.VMOwnedVolumesAnnotation), "modifying this annotation is not allowed for non-admin users").Error()),
+				},
+			),
+			Entry("should allow the VMOwnedVolumes annotation absent-to-true transition, by SSO user",
+				testParams{
+					setup: func(ctx *unitValidatingWebhookContext) {
+						delete(ctx.oldVM.Annotations, pkgconst.VMOwnedVolumesAnnotation)
+						ctx.vm.Annotations[pkgconst.VMOwnedVolumesAnnotation] = "true"
+					},
+					expectAllowed: true,
+				},
+			),
+			Entry("should allow an unchanged VMOwnedVolumes annotation, by SSO user",
+				testParams{
+					setup: func(ctx *unitValidatingWebhookContext) {
+						ctx.oldVM.Annotations[pkgconst.VMOwnedVolumesAnnotation] = "true"
+						ctx.vm.Annotations[pkgconst.VMOwnedVolumesAnnotation] = "true"
+					},
+					expectAllowed: true,
+				},
+			),
+			Entry("should allow changing the VMOwnedVolumes annotation once set, by privileged user",
+				testParams{
+					setup: func(ctx *unitValidatingWebhookContext) {
+						ctx.IsPrivilegedAccount = true
+						ctx.oldVM.Annotations[pkgconst.VMOwnedVolumesAnnotation] = "true"
+						ctx.vm.Annotations[pkgconst.VMOwnedVolumesAnnotation] = "false"
+					},
+					expectAllowed: true,
+				},
+			),
 		)
 
 	})
@@ -8616,6 +8665,41 @@ func unitTestsValidateUpdate() { //nolint:gocyclo
 					expectAllowed: false,
 				},
 			),
+			Entry("when the revert target snapshot is being deleted",
+				testParams{
+					setup: func(ctx *unitValidatingWebhookContext) {
+						vmSnapshot := builder.DummyVirtualMachineSnapshot(
+							ctx.vm.Namespace,
+							"dummy-vm-snapshot",
+							ctx.vm.Name,
+						)
+						vmSnapshot.Finalizers = []string{"test.vmoperator.vmware.com/fake"}
+						Expect(ctx.Client.Create(ctx, vmSnapshot)).To(Succeed())
+						Expect(ctx.Client.Delete(ctx, vmSnapshot)).To(Succeed())
+
+						ctx.vm.Spec.CurrentSnapshotName = vmSnapshot.Name
+					},
+					validate: doValidateWithMsg(
+						field.Forbidden(snapshotPath, "cannot revert to a snapshot that is being deleted").Error(),
+					),
+					expectAllowed: false,
+				},
+			),
+			Entry("when the revert target snapshot exists and is not being deleted",
+				testParams{
+					setup: func(ctx *unitValidatingWebhookContext) {
+						vmSnapshot := builder.DummyVirtualMachineSnapshot(
+							ctx.vm.Namespace,
+							"dummy-vm-snapshot",
+							ctx.vm.Name,
+						)
+						Expect(ctx.Client.Create(ctx, vmSnapshot)).To(Succeed())
+
+						ctx.vm.Spec.CurrentSnapshotName = vmSnapshot.Name
+					},
+					expectAllowed: true,
+				},
+			),
 		)
 	})
 
@@ -8814,6 +8898,164 @@ func unitTestsValidateUpdate() { //nolint:gocyclo
 						ctx.vm.Spec.Volumes[0].ApplicationType = ""
 						ctx.vm.Spec.Volumes[0].SharingMode = vmopv1.VolumeSharingModeNone
 						ctx.vm.Spec.Volumes[0].DiskMode = vmopv1.VolumeDiskModeIndependentPersistent
+					},
+					expectAllowed: true,
+				},
+			),
+		)
+	})
+
+	Context("Owned volume attach", func() {
+		const (
+			ownedPVCName = "owned-pvc"
+			ownedPVName  = "owned-pv"
+			ownedVolID   = "owned-vol-id"
+			otherVMName  = "other-vm"
+		)
+
+		newOwnedVolPath := field.NewPath("spec", "volumes").Index(1)
+
+		seedPVAndPVC := func(ctx *unitValidatingWebhookContext, accessMode corev1.PersistentVolumeAccessMode) {
+			pvc := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      ownedPVCName,
+					Namespace: ctx.vm.Namespace,
+				},
+				Spec: corev1.PersistentVolumeClaimSpec{
+					VolumeName:  ownedPVName,
+					AccessModes: []corev1.PersistentVolumeAccessMode{accessMode},
+				},
+			}
+			Expect(ctx.Client.Create(ctx, pvc)).To(Succeed())
+
+			pv := &corev1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: ownedPVName,
+				},
+				Spec: corev1.PersistentVolumeSpec{
+					PersistentVolumeSource: corev1.PersistentVolumeSource{
+						CSI: &corev1.CSIPersistentVolumeSource{
+							VolumeHandle: ownedVolID,
+						},
+					},
+				},
+			}
+			Expect(ctx.Client.Create(ctx, pv)).To(Succeed())
+		}
+
+		addNewOwnedVolume := func(ctx *unitValidatingWebhookContext, diskMode vmopv1.VolumeDiskMode) {
+			ctx.vm.Spec.Volumes = append(ctx.vm.Spec.Volumes, vmopv1.VirtualMachineVolume{
+				Name:     "owned-vol",
+				DiskMode: diskMode,
+				VirtualMachineVolumeSource: vmopv1.VirtualMachineVolumeSource{
+					PersistentVolumeClaim: &vmopv1.PersistentVolumeClaimVolumeSource{
+						PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+							ClaimName: ownedPVCName,
+						},
+					},
+				},
+			})
+		}
+
+		BeforeEach(func() {
+			pkgcfg.SetContext(ctx, func(config *pkgcfg.Config) {
+				config.Features.VMOwnedVolumes = true
+			})
+			metav1.SetMetaDataAnnotation(&ctx.vm.ObjectMeta, pkgconst.VMOwnedVolumesAnnotation, "true")
+			metav1.SetMetaDataAnnotation(&ctx.oldVM.ObjectMeta, pkgconst.VMOwnedVolumesAnnotation, "true")
+		})
+
+		DescribeTable("Updates", doTest,
+			Entry("should deny attaching an RWO PVC already attached to another VM in independent mode",
+				testParams{
+					setup: func(ctx *unitValidatingWebhookContext) {
+						seedPVAndPVC(ctx, corev1.ReadWriteOnce)
+						cvi := &cnsv1alpha1.CsiVolumeInfo{
+							ObjectMeta: metav1.ObjectMeta{
+								Name:      cnsv1alpha1.CVINamePrefix + ownedVolID,
+								Namespace: cnsv1alpha1.CVINamespace,
+							},
+							Spec: cnsv1alpha1.CsiVolumeInfoSpec{
+								VolumeID: ownedVolID,
+								VMs: []cnsv1alpha1.VirtualMachineRef{
+									{
+										VMName:   otherVMName,
+										DiskMode: cnsv1alpha1.CVIDiskModeIndependentPersistent,
+									},
+								},
+							},
+						}
+						Expect(ctx.Client.Create(ctx, cvi)).To(Succeed())
+
+						addNewOwnedVolume(ctx, vmopv1.VolumeDiskModeIndependentPersistent)
+					},
+					validate: doValidateWithMsg(
+						field.Invalid(newOwnedVolPath, "owned-vol", "PVC is already attached to another VM").Error(),
+					),
+					expectAllowed: false,
+				},
+			),
+			Entry("should deny attaching a PVC already attached to another VM in a different disk mode",
+				testParams{
+					setup: func(ctx *unitValidatingWebhookContext) {
+						seedPVAndPVC(ctx, corev1.ReadWriteMany)
+						cvi := &cnsv1alpha1.CsiVolumeInfo{
+							ObjectMeta: metav1.ObjectMeta{
+								Name:      cnsv1alpha1.CVINamePrefix + ownedVolID,
+								Namespace: cnsv1alpha1.CVINamespace,
+							},
+							Spec: cnsv1alpha1.CsiVolumeInfoSpec{
+								VolumeID: ownedVolID,
+								VMs: []cnsv1alpha1.VirtualMachineRef{
+									{
+										VMName:   otherVMName,
+										DiskMode: cnsv1alpha1.CVIDiskModePersistent,
+									},
+								},
+							},
+						}
+						Expect(ctx.Client.Create(ctx, cvi)).To(Succeed())
+
+						addNewOwnedVolume(ctx, vmopv1.VolumeDiskModeIndependentPersistent)
+					},
+					validate: doValidateWithMsg(
+						field.Invalid(newOwnedVolPath, "owned-vol",
+							fmt.Sprintf("PVC is already attached to VM %q in a different disk mode", otherVMName)).Error(),
+					),
+					expectAllowed: false,
+				},
+			),
+			Entry("should allow attaching an RWM PVC already attached to another VM in the same disk mode",
+				testParams{
+					setup: func(ctx *unitValidatingWebhookContext) {
+						seedPVAndPVC(ctx, corev1.ReadWriteMany)
+						cvi := &cnsv1alpha1.CsiVolumeInfo{
+							ObjectMeta: metav1.ObjectMeta{
+								Name:      cnsv1alpha1.CVINamePrefix + ownedVolID,
+								Namespace: cnsv1alpha1.CVINamespace,
+							},
+							Spec: cnsv1alpha1.CsiVolumeInfoSpec{
+								VolumeID: ownedVolID,
+								VMs: []cnsv1alpha1.VirtualMachineRef{
+									{
+										VMName:   otherVMName,
+										DiskMode: cnsv1alpha1.CVIDiskModePersistent,
+									},
+								},
+							},
+						}
+						Expect(ctx.Client.Create(ctx, cvi)).To(Succeed())
+
+						addNewOwnedVolume(ctx, vmopv1.VolumeDiskModePersistent)
+					},
+					expectAllowed: true,
+				},
+			),
+			Entry("should allow attaching a PVC with no existing CsiVolumeInfo",
+				testParams{
+					setup: func(ctx *unitValidatingWebhookContext) {
+						seedPVAndPVC(ctx, corev1.ReadWriteOnce)
+						addNewOwnedVolume(ctx, vmopv1.VolumeDiskModeIndependentPersistent)
 					},
 					expectAllowed: true,
 				},
