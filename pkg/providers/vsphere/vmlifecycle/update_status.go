@@ -1615,11 +1615,25 @@ func updateVolumeStatus(vmCtx pkgctx.VirtualMachineContext) {
 	}
 
 	// Remove any status entries for classic disks that no longer exist in
-	// config.hardware.device.
+	// config.hardware.device. Managed disks get the same treatment once they
+	// have a DiskUUID: a migration-driven FCD unregister/re-register (VM-owned
+	// volumes) assigns a disk a new DiskUUID, and the name-based dedup above
+	// only fires when the live DiskUUID still matches an existing entry — so
+	// without this, the pre-migration entry (already promoted to Managed by
+	// the registration-race handling above) would never be pruned and would
+	// permanently duplicate the fresh, correctly-named entry for the same
+	// physical disk. A Managed entry with an empty DiskUUID (not yet attached)
+	// is left alone.
 	vm.Status.Volumes = slices.DeleteFunc(vm.Status.Volumes,
 		func(e vmopv1.VirtualMachineVolumeStatus) bool {
 			switch e.Type {
 			case vmopv1.VolumeTypeClassic:
+				_, keep := existingDisksInConfig[e.DiskUUID]
+				return !keep
+			case vmopv1.VolumeTypeManaged:
+				if e.DiskUUID == "" {
+					return false
+				}
 				_, keep := existingDisksInConfig[e.DiskUUID]
 				return !keep
 			default:
