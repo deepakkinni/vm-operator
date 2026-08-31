@@ -125,6 +125,25 @@ const (
 	// The value is the reason for the restart.
 	LastRestartReasonAnnotationKey = "vmoperator.vmware.com/last-restart-reason"
 
+	// StaleDiskPathAnnotationKey is applied by the volumeattachdetach
+	// controller to a CsiVolumeInfo, recording the spec.diskPath value that
+	// was found stale when a diskPath refresh was requested for it.
+	//
+	// It exists to make the refresh request one-shot per path. CSI cannot
+	// always produce a new value: for a dependent volume it resolves the path
+	// from the VM's own device list, which by definition cannot answer while
+	// the disk is detached — and the refresh is requested precisely because an
+	// attach just failed. CSI therefore clears the refresh annotation having
+	// kept the recorded path, and without this record vm-operator would see a
+	// cleared annotation, retry the same path, fail again, and request another
+	// refresh, indefinitely.
+	//
+	// Comparing this value against the current spec.diskPath after a refresh
+	// completes distinguishes "CSI produced a new path, retry is worthwhile"
+	// from "CSI returned the same path, retrying cannot help" — the latter
+	// being a permanent condition to surface rather than spin on.
+	StaleDiskPathAnnotationKey = "vmoperator.vmware.com/stale-diskpath"
+
 	// VCCredsSecretName is the name of the secret in the pod namespace
 	// that contains the VC credentials.
 	VCCredsSecretName = "wcp-vmop-sa-vc-auth" //nolint:gosec

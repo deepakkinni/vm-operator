@@ -26,6 +26,16 @@ import (
 	"github.com/vmware-tanzu/vm-operator/pkg/volumes/owned"
 )
 
+// ErrDiskPathRefreshExhausted means a diskPath refresh has already completed
+// for the failing path and returned that same path, so the attach cannot be
+// made to succeed by asking again.
+//
+// This is a permanent condition, deliberately distinguished from the ordinary
+// stale-path case: the latter requeues and retries, while this must surface so
+// an operator sees it. Retrying costs a ReconfigVM_Task against vCenter every
+// few seconds and would never converge.
+var ErrDiskPathRefreshExhausted = errors.New("diskPath refresh did not yield a new path")
+
 // reconcileOwnedVolumes reconciles CsiVolumeInfo-based volume attach/detach
 // for VM-owned-volumes VMs. It is called from ReconcileNormal when the VM has the
 // VMOwnedVolumes annotation. It handles Workflow A (attach) and Workflow B
@@ -217,6 +227,22 @@ func (r *Reconciler) reconcileOwnedVolumeAttach(ctx *pkgctx.VolumeContext) error
 			continue
 		}
 
+		// The refresh has finished (no annotation) and produced a path
+		// different from the one recorded as stale, so the record is spent:
+		// drop it, allowing a future staleness at this new path its own
+		// refresh attempt. Doing this here rather than on the attach path
+		// costs nothing — the CsiVolumeInfo is already in hand.
+		if prev, ok := cvi.Annotations[pkgconst.StaleDiskPathAnnotationKey]; ok && prev != cvi.Spec.DiskPath {
+			patch := ctrlclient.MergeFrom(cvi.DeepCopy())
+			delete(cvi.Annotations, pkgconst.StaleDiskPathAnnotationKey)
+			if err := r.Client.Patch(ctx, cvi, patch); err != nil {
+				return fmt.Errorf("failed to clear %s on CsiVolumeInfo %s: %w",
+					pkgconst.StaleDiskPathAnnotationKey, cvi.Name, err)
+			}
+			ctx.Logger.Info("Cleared spent stale-diskPath record after a successful refresh",
+				"pvc", claimName, "cvi", cvi.Name, "previous", prev, "current", cvi.Spec.DiskPath)
+		}
+
 		// Two readiness classes (attach/detach §7.3 A.4/A.5): a dependent
 		// disk requires CSI's ownership-transfer handshake to finish — the
 		// green signal — before its FCD is vm-operator's to attach. An
@@ -329,7 +355,15 @@ func (r *Reconciler) attachReadyDisks(
 				if !ok {
 					continue
 				}
-				if reqErr := r.requestDiskPathRefresh(ctx, vm, rd.plan.ClaimName); reqErr != nil {
+				// rd.diskPath is the value this reconcile actually tried, read
+				// from spec.diskPath before the attach — which is what makes it
+				// the right thing to record as "already refreshed for".
+				if reqErr := r.requestDiskPathRefresh(ctx, vm, rd.plan.ClaimName, rd.diskPath); reqErr != nil {
+					if errors.Is(reqErr, ErrDiskPathRefreshExhausted) {
+						// Not retryable: surface it rather than requeueing into
+						// a ReconfigVM_Task loop that cannot converge.
+						return fmt.Errorf("cannot attach volume %q: %w", volumeName, reqErr)
+					}
 					return fmt.Errorf("failed to request diskPath refresh for volume %q: %w", volumeName, reqErr)
 				}
 			}
@@ -405,7 +439,7 @@ func readyDiskByVolumeName(ready []readyDependentDisk, volumeName string) (ready
 // being non-empty is a durable invariant vm-operator's own attach path also
 // relies on, so only CSI may touch it; this annotation is the signal.
 func (r *Reconciler) requestDiskPathRefresh(
-	ctx *pkgctx.VolumeContext, vm *vmopv1.VirtualMachine, claimName string) error {
+	ctx *pkgctx.VolumeContext, vm *vmopv1.VirtualMachine, claimName, stalePath string) error {
 
 	cvi, err := vmopv1util.GetCVIForPVC(ctx, r.Client, vm.Namespace, claimName)
 	if err != nil {
@@ -415,13 +449,24 @@ func (r *Reconciler) requestDiskPathRefresh(
 		return nil
 	}
 
+	// A refresh has already run for this exact path and did not change it, so
+	// requesting another cannot help — CSI resolves a dependent volume's path
+	// from the VM's device list, which cannot answer while the disk is
+	// detached, and it is detached precisely because the attach failed. Fail
+	// permanently instead of spinning.
+	if prev, ok := cvi.Annotations[pkgconst.StaleDiskPathAnnotationKey]; ok && prev == stalePath {
+		return fmt.Errorf("%w: diskPath %q for PVC %s", ErrDiskPathRefreshExhausted, stalePath, claimName)
+	}
+
 	patch := ctrlclient.MergeFrom(cvi.DeepCopy())
 	metav1.SetMetaDataAnnotation(&cvi.ObjectMeta, cnsv1alpha1.DiskPathRefreshRequestedAnnotation, "true")
+	metav1.SetMetaDataAnnotation(&cvi.ObjectMeta, pkgconst.StaleDiskPathAnnotationKey, stalePath)
 	if err := r.Client.Patch(ctx, cvi, patch); err != nil {
 		return fmt.Errorf("failed to set %s on CsiVolumeInfo %s: %w",
 			cnsv1alpha1.DiskPathRefreshRequestedAnnotation, cvi.Name, err)
 	}
-	ctx.Logger.Info("Requested diskPath refresh for stale-attach PVC", "pvc", claimName, "cvi", cvi.Name)
+	ctx.Logger.Info("Requested diskPath refresh for stale-attach PVC",
+		"pvc", claimName, "cvi", cvi.Name, "stalePath", stalePath)
 	return nil
 }
 

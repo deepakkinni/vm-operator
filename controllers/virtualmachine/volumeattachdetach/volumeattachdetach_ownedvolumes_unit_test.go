@@ -758,6 +758,94 @@ var _ = Describe(
 								"the CVI must carry the refresh-requested annotation after a stale-path failure")
 						})
 
+						It("records the stale path alongside the refresh request", func() {
+							ctx.VMProvider.(*providerfake.VMProvider).AttachVolumeDisksFn = func(
+								_ context.Context, _ *vmopv1.VirtualMachine, disks []providers.VolumeDiskAddSpec,
+							) ([]providers.VolumeDiskPlacement, error) {
+								return nil, pkgerr.StaleDiskPathError{
+									VolumeNames: []string{"vol-persistent"},
+									Path:        disks[0].DiskPath,
+									Cause:       errors.New("file not found"),
+								}
+							}
+
+							Expect(reconciler.ReconcileNormal(volCtx)).ToNot(Succeed())
+
+							cvi := &cnsv1alpha1.CsiVolumeInfo{}
+							Expect(ctx.Client.Get(ctx, client.ObjectKey{
+								Name:      vmopv1util.CVINameForVolumeID(volID),
+								Namespace: cnsv1alpha1.CVINamespace,
+							}, cvi)).To(Succeed())
+							Expect(cvi.Annotations).To(HaveKeyWithValue(
+								pkgconst.StaleDiskPathAnnotationKey, cvi.Spec.DiskPath),
+								"the path that failed must be recorded so a second, futile refresh is not requested")
+						})
+
+						When("a refresh has already completed for this exact path without changing it", func() {
+							// CSI resolves a dependent volume's path from the
+							// VM's device list, which cannot answer while the
+							// disk is detached — and it is detached precisely
+							// because the attach failed. So CSI clears the
+							// refresh annotation having kept the same path.
+							// Asking again cannot help.
+							JustBeforeEach(func() {
+								cvi := &cnsv1alpha1.CsiVolumeInfo{}
+								Expect(ctx.Client.Get(ctx, client.ObjectKey{
+									Name:      vmopv1util.CVINameForVolumeID(volID),
+									Namespace: cnsv1alpha1.CVINamespace,
+								}, cvi)).To(Succeed())
+								patch := client.MergeFrom(cvi.DeepCopy())
+								metav1.SetMetaDataAnnotation(&cvi.ObjectMeta,
+									pkgconst.StaleDiskPathAnnotationKey, cvi.Spec.DiskPath)
+								Expect(ctx.Client.Patch(ctx, cvi, patch)).To(Succeed())
+							})
+
+							It("fails permanently instead of requeueing into a ReconfigVM loop", func() {
+								ctx.VMProvider.(*providerfake.VMProvider).AttachVolumeDisksFn = func(
+									_ context.Context, _ *vmopv1.VirtualMachine, disks []providers.VolumeDiskAddSpec,
+								) ([]providers.VolumeDiskPlacement, error) {
+									return nil, pkgerr.StaleDiskPathError{
+										VolumeNames: []string{"vol-persistent"},
+										Path:        disks[0].DiskPath,
+										Cause:       errors.New("file not found"),
+									}
+								}
+
+								err := reconciler.ReconcileNormal(volCtx)
+								Expect(err).To(HaveOccurred())
+								Expect(errors.Is(err, volumeattachdetach.ErrDiskPathRefreshExhausted)).To(BeTrue(),
+									"a refresh that cannot produce a new path must surface, not spin; got: %v", err)
+								Expect(pkgerr.IsRequeueError(err)).To(BeFalse(),
+									"requeueing here costs a ReconfigVM_Task every few seconds and never converges")
+							})
+						})
+
+						When("a refresh produced a different path than the one recorded stale", func() {
+							JustBeforeEach(func() {
+								cvi := &cnsv1alpha1.CsiVolumeInfo{}
+								Expect(ctx.Client.Get(ctx, client.ObjectKey{
+									Name:      vmopv1util.CVINameForVolumeID(volID),
+									Namespace: cnsv1alpha1.CVINamespace,
+								}, cvi)).To(Succeed())
+								patch := client.MergeFrom(cvi.DeepCopy())
+								metav1.SetMetaDataAnnotation(&cvi.ObjectMeta,
+									pkgconst.StaleDiskPathAnnotationKey, "[ds] fcd/some-old-path.vmdk")
+								Expect(ctx.Client.Patch(ctx, cvi, patch)).To(Succeed())
+							})
+
+							It("clears the spent record so a future staleness gets its own refresh", func() {
+								Expect(reconciler.ReconcileNormal(volCtx)).To(Succeed())
+
+								cvi := &cnsv1alpha1.CsiVolumeInfo{}
+								Expect(ctx.Client.Get(ctx, client.ObjectKey{
+									Name:      vmopv1util.CVINameForVolumeID(volID),
+									Namespace: cnsv1alpha1.CVINamespace,
+								}, cvi)).To(Succeed())
+								Expect(cvi.Annotations).ToNot(HaveKey(pkgconst.StaleDiskPathAnnotationKey),
+									"a record for a path that is no longer current must not block a later refresh")
+							})
+						})
+
 						When("the CVI already carries the diskpath-refresh-requested annotation", func() {
 							JustBeforeEach(func() {
 								cvi := &cnsv1alpha1.CsiVolumeInfo{}
